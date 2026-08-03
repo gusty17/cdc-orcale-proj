@@ -1,0 +1,36 @@
+{
+  "name": "t24-account-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.oracle.OracleConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "oracle",
+    "database.port": "1521",
+    "database.user": "c##dbzuser",
+    "database.password": "dbz",
+    "database.dbname": "XE",
+    "database.pdb.name": "XEPDB1",
+
+    "topic.prefix": "t24",
+    "table.include.list": "T24\\.ACCOUNT",
+
+    "//": "Capture ONLY the two physically stored columns. The other 9 are virtual: LogMiner emits the text of their defining expression instead of a value, so without this they arrive as garbage on every update.",
+    "column.include.list": "T24\\.ACCOUNT\\.(RECID|XMLRECORD)",
+
+    "//lob": "Required - XMLRECORD is XMLTYPE, stored as a hidden BLOB. Without this the XML never arrives.",
+    "lob.enabled": "true",
+
+    "//strategy": "online_catalog reads the live data dictionary. The default (redo_log_catalog) dumps the dictionary into the redo stream and does not surface a change until its log is archived - on XE's two 10MB groups that means an idle table sits unmined indefinitely. Trade-off: online_catalog cannot track DDL changes to the captured table, which is fine for a fixed RECID/XMLRECORD shape.",
+    "log.mining.strategy": "online_catalog",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "schema-history.t24",
+
+    "snapshot.mode": "initial",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
