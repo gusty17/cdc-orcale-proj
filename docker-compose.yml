@@ -105,6 +105,28 @@ services:
       retries: 20
       start_period: 30s
 
+  # ---------------------------------------------------------------------
+  # RisingWave - streaming SQL engine, reads the Kafka topic directly
+  # ---------------------------------------------------------------------
+  # single_node mode runs meta/compute/frontend/compactor in one process -
+  # fine for a lab, not for production. Speaks the Postgres wire protocol
+  # on 4566, so any Postgres client (psql, DBeaver, etc.) can query it.
+  risingwave:
+    image: risingwavelabs/risingwave:v2.0.5
+    container_name: cdc-risingwave
+    command: single_node
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "4566:4566"    # Postgres-wire SQL port
+      - "5691:5691"    # meta HTTP dashboard
+    environment:
+      RW_SINGLE_NODE_STORE_DIRECTORY: /risingwave/data
+    volumes:
+      - risingwave-data:/risingwave/data
+
 volumes:
   oracle-data:
   kafka-data:
+  risingwave-data:

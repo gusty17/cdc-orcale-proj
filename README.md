@@ -4,13 +4,14 @@ Change data capture from Oracle into Kafka topics, using the Debezium Oracle
 connector in LogMiner mode.
 
 ```
-Oracle XE 21c  ──redo/archived redo──▶  Debezium (Kafka Connect)  ──▶  Kafka topics
-   T24.ACCOUNT                              LogMiner adapter
+Oracle XE 21c  ──redo/archived redo──▶  Debezium (Kafka Connect)  ──▶  Kafka topics  ──▶  RisingWave
+   T24.ACCOUNT                              LogMiner adapter          t24.T24.ACCOUNT      t24_account
 ```
 
-Current status: **steps 1 and 2 are done** — Oracle is configured for CDC and the
-container stack runs. The connector itself (`oracle-connector.json`) is not
-written yet.
+Current status: **steps 1-4 are done** — Oracle is configured for CDC, the
+container stack runs (including RisingWave), the connector is deployed, and
+change events flow end-to-end from Oracle into a live, queryable RisingWave
+table.
 
 ---
 
@@ -293,6 +294,48 @@ an array, not a scalar.
 
 ---
 
+## Step 4 — RisingWave, reading the topic directly
+
+`docker-compose.yml` runs it in `single_node` mode (meta/compute/frontend/
+compactor in one process — fine for a lab, not production). It speaks the
+Postgres wire protocol on port 4566, so any Postgres client works, including
+`psql` from a throwaway container if none is installed locally:
+
+```powershell
+docker run --rm --network cdc-oracle_default postgres:16-alpine `
+  psql -h risingwave -p 4566 -d dev -U root -f /tmp/setup.sql
+# (mount risingwave-setup.sql to /tmp/setup.sql, or pipe it via -f /dev/stdin)
+```
+
+`risingwave-setup.sql` creates a **table** (not a source) backed directly by
+the Kafka topic:
+
+```sql
+CREATE TABLE t24_account (
+    recid VARCHAR, xmlrecord VARCHAR, PRIMARY KEY (recid)
+) WITH (
+    connector = 'kafka', topic = 't24.T24.ACCOUNT',
+    properties.bootstrap.server = 'kafka:9092', scan.startup.mode = 'earliest'
+) FORMAT DEBEZIUM ENCODE JSON;
+```
+
+`FORMAT DEBEZIUM ENCODE JSON` unwraps Debezium's `{op, before, after, ...}`
+envelope automatically and applies each insert/update/delete against
+`PRIMARY KEY (recid)` — `CREATE TABLE` rather than `CREATE SOURCE` is what
+makes RisingWave actually materialize and maintain current state, instead of
+only exposing the raw event stream.
+
+### Verified: insert, update, and delete all propagate correctly
+
+```sql
+SELECT recid, LENGTH(xmlrecord) FROM t24_account;
+```
+
+Confirmed a delete made directly in Oracle correctly removed the row here
+too — RisingWave's table matched Oracle exactly before and after. Full XML
+content (all tags, Arabic text) also checked byte-for-byte intact through
+the whole pipeline: Oracle → Debezium → Kafka → RisingWave.
+
 ---
 
 ## Testing CDC manually
@@ -371,8 +414,10 @@ docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhos
 
 ## Not done yet
 
-- Downstream flattening of the XML into ~20 typed columns (RisingWave, or a
-  Kafka Connect SMT).
-- `risingwave-setup.sql` — empty, left over from the earlier plan.
+- Downstream flattening of the XML into ~20 typed columns — `t24_account` in
+  RisingWave currently stores `xmlrecord` as one raw XML string; parsing it
+  into individual fields (a RisingWave generated column, materialized view
+  with `XMLQUERY`-equivalent extraction, or a Kafka Connect SMT upstream)
+  isn't built yet.
 - No topic browser in the stack; `obsidiandynamics/kafdrop` is already pulled
   locally if one is wanted.
