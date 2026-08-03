@@ -336,6 +336,106 @@ too — RisingWave's table matched Oracle exactly before and after. Full XML
 content (all tags, Arabic text) also checked byte-for-byte intact through
 the whole pipeline: Oracle → Debezium → Kafka → RisingWave.
 
+### Audit trail — every change, with before/after and both timestamps
+
+`t24_account` only shows current state — `FORMAT DEBEZIUM` collapses history
+by applying each change over the primary key. `risingwave-setup.sql` also
+creates a second, append-only table reading the **same topic** a different
+way:
+
+```sql
+CREATE TABLE t24_account_events (
+    op VARCHAR, "before" JSONB, "after" JSONB, source JSONB, ts_ms BIGINT
+) WITH (
+    connector = 'kafka', topic = 't24.T24.ACCOUNT',
+    properties.bootstrap.server = 'kafka:9092', scan.startup.mode = 'earliest'
+) FORMAT PLAIN ENCODE JSON;
+```
+
+`FORMAT PLAIN` (vs `FORMAT DEBEZIUM` above) does **not** apply changes
+against a key — every message becomes its own permanent row, nothing ever
+overwritten or removed. `before`/`after`/`source` are kept as raw `JSONB`
+rather than pre-extracted columns, so this table survives if T24's fields
+ever change.
+
+A materialized view on top, `t24_account_audit`, does the field extraction
+and exposes two different "when" columns — `db_commit_time` (from
+`source->>'ts_ms'`, when the change actually committed in Oracle) and
+`captured_time` (top-level `ts_ms`, when Debezium/Kafka processed it). They
+differ by mining + streaming lag — a few seconds in this lab.
+
+### Why `MATERIALIZED VIEW`, not `TABLE` or a plain `VIEW`
+
+Tested all three directly rather than assuming:
+
+- **`CREATE TABLE ... AS SELECT`** — confirmed to take a **one-time
+  snapshot** that never updates again. Inserted a fresh row in Oracle
+  afterward; the source table and a plain view both picked it up, this did
+  not — permanently frozen at creation time, no error or warning. Wrong for
+  something meant to keep growing forever.
+- **Plain `CREATE VIEW`** — stays live (re-runs the query fresh every time),
+  but has no storage of its own — it recomputes the whole `LAG()` over
+  `t24_account_events` on every single query, getting more expensive as the
+  event log grows.
+- **`CREATE MATERIALIZED VIEW`** — gets both: RisingWave's streaming engine
+  keeps it incrementally, continuously up to date in the background (a
+  fresh insert *and* a fresh update both appeared automatically, with
+  `before_xmlrecord` correctly reconstructed, no manual refresh needed),
+  while queries against it read pre-computed, stored results — same speed
+  as a table.
+
+### `before_xmlrecord` is reconstructed, not taken from Debezium directly
+
+`XMLRECORD` is a LOB (`XMLTYPE`); Oracle's redo log never carries LOB
+before-images, so Debezium's own `before.XMLRECORD` is always the literal
+string `__debezium_unavailable_value` on `UPDATE`/`DELETE` — confirmed by
+testing, not a hypothetical, and there's no Oracle-side setting that fixes
+it (same limitation noted back in Step 3).
+
+Instead, since `t24_account_events` already keeps **every** version of every
+row forever, the real prior XML is simply the previous row's `after` value —
+`t24_account_audit` reconstructs it with a window function, no change to
+Oracle or T24's schema needed:
+
+```sql
+CREATE MATERIALIZED VIEW t24_account_audit AS
+WITH base AS (
+    SELECT
+        CASE op WHEN 'r' THEN 'SNAPSHOT' WHEN 'c' THEN 'INSERT'
+                WHEN 'u' THEN 'UPDATE'   WHEN 'd' THEN 'DELETE' ELSE op END AS operation,
+        COALESCE("after"->>'RECID', "before"->>'RECID') AS recid,
+        "after"->>'XMLRECORD' AS after_xmlrecord,
+        to_timestamp((source->>'ts_ms')::bigint / 1000.0) AS db_commit_time,
+        to_timestamp(ts_ms / 1000.0)                       AS captured_time
+    FROM t24_account_events
+)
+SELECT recid, operation,
+       LAG(after_xmlrecord) OVER (PARTITION BY recid ORDER BY captured_time) AS before_xmlrecord,
+       after_xmlrecord, db_commit_time, captured_time
+FROM base;
+```
+
+Verified with a real insert → update → update cycle (content markers
+`ROUND-ONE` → `ROUND-TWO`):
+
+```
+operation | before    | after     | captured_time
+INSERT    | (none)    | ROUND-ONE | 21:04:43
+UPDATE    | ROUND-ONE | ROUND-TWO | 21:05:04
+```
+
+Correctly chained — actual real prior content, not the placeholder. Only
+gap: a row's very first version (its own `INSERT`/`SNAPSHOT`) has no prior
+row to reconstruct from, so `before_xmlrecord` is genuinely `NULL` there —
+which is correct, since no earlier version exists to show.
+
+Other options considered but not built: a `BEFORE UPDATE/DELETE` trigger on
+`T24.ACCOUNT` copying the old XML to a shadow table (works, but requires
+modifying the real T24 schema — needs actual DBA/vendor sign-off, not
+something to add unilaterally); Flashback Query looked up per event
+(technically possible, but means querying Oracle back per event, defeating
+the point of CDC and adding load to production).
+
 ---
 
 ## Testing CDC manually
