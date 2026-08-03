@@ -512,12 +512,98 @@ docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhos
 
 ---
 
+## Step 5 — Flattening the XML into real columns (`flatten/`)
+
+`t24_account` stores `xmlrecord` as one opaque string. `flatten/` splits it
+into named business columns in a separate RisingWave table.
+
+**Why Python and not SQL:** RisingWave has **no XML functions at all** —
+`rw_catalog.rw_functions` returns zero rows for anything XML/XPath. Parsing
+had to happen outside the database.
+
+```powershell
+pip install -r flatten/requirements.txt
+
+python flatten/generate_schema.py         # sample XML + lookup CSV -> DDL + column map
+# apply flatten/create_table.sql to RisingWave, then:
+python flatten/consume_to_risingwave.py --from-beginning --idle-exit 15
+```
+
+### Three tag shapes, three mapping rules
+
+`lookup_metadata.csv` (289 rows / 256 fields, no name collisions) describes
+three genuinely different shapes, and the generator handles each:
+
+| Shape | Example | Becomes |
+| --- | --- | --- |
+| Scalar | `c1` occurs once | `customer` |
+| **`c20` = T24 LOCAL.REF** | each position is a *different* field | `m=4` → `arabic_title`, `m=32` → `nab_flag` |
+| True array | `c47` repeats the same field | `cap_date_cr_int_01` … `_23` |
+
+Rule: an exact `(field, position)` row in the lookup wins; otherwise use the
+base name, numbered only when the field actually repeats. Result for this
+sample: **166 columns** (recid + 165).
+
+Parallel arrays stay aligned — `alt_acct_type_02` = `T24.IBAN` pairs with
+`alt_acct_id_02` = `EG00ANON…`.
+
+**Positions are collected as a set, not a max.** `c20` occupies positions
+`1,2,3,4,32` in the sample — sparse, not contiguous. Generating
+`range(1, max+1)` produced 32 `c20` columns when only 5 could ever hold data,
+inventing 27 always-NULL columns for `m=5..31` (`hold_details`, `ac_amt_loc`,
+`email_address`, …) — which contradicted the whole "only tags present"
+premise. Iterating observed positions instead dropped the schema from 192
+columns to 165 with no data loss. True arrays are unaffected: `c47`'s
+positions really are contiguous `1..23`.
+
+### Schema is sample-derived, and says so when that hurts
+
+The schema comes from tags **present in the sample**, not all 256 lookup
+fields — so `mnemonic` (`c6`), `posting_restrict` (`c13`) and
+`int_no_booking` (`c17`) have no column. The consumer therefore **warns
+loudly** on any unmapped tag or array position past the cap rather than
+dropping it silently. Re-run `generate_schema.py` against a richer sample to
+widen the schema.
+
+### RisingWave write semantics — verified, and one of them caused a real bug
+
+| Behaviour | Consequence |
+| --- | --- |
+| `INSERT` on an existing PK **upserts** | Debezium `r`/`c`/`u` all map to plain `INSERT` |
+| `DELETE` works normally | `op=d` maps to `DELETE` |
+| **Writes are invisible until `FLUSH`** | every batch must end with one |
+
+That last one produced a genuine bug on the first run: the flattened table
+ended up with **7 rows against Oracle's 1**. Batching INSERTs and DELETEs
+into a single flush meant `DELETE ... WHERE recid = X` ran *before* the
+matching INSERT was visible, matched nothing, and the row survived.
+
+Fix wasn't just an extra `FLUSH` — the consumer now collapses each `recid` to
+its **final** operation within a batch, so a row can never be both upserted
+and deleted in one flush. Re-run afterwards: 12 upserts collapsed to 1, and
+the table matched `t24_account` exactly.
+
+### Verified end to end
+
+Live insert / update / delete against Oracle, each picked up correctly:
+
+```
+recid            | customer | currency | working_balance | co_code   | arabic_title
+9000000112345001 | 90000001 | EGP      | 24178.54        | EG0010039 | عميل تجريبي مجهول
+```
+
+An update that omitted `c78` correctly set `opening_date` back to `NULL`,
+and a delete removed the row — flattened table stayed in step with Oracle
+throughout.
+
+---
+
 ## Not done yet
 
-- Downstream flattening of the XML into ~20 typed columns — `t24_account` in
-  RisingWave currently stores `xmlrecord` as one raw XML string; parsing it
-  into individual fields (a RisingWave generated column, materialized view
-  with `XMLQUERY`-equivalent extraction, or a Kafka Connect SMT upstream)
-  isn't built yet.
+- Typed columns — everything in `t24_account_columns` is `VARCHAR`. T24 dates
+  are `YYYYMMDD` strings and amounts are decimal strings; casting them needs
+  per-field type rules that aren't in `lookup_metadata.csv`.
+- The consumer is a standalone script, not a service — no restart supervision,
+  and it relies on Kafka consumer-group offsets to resume.
 - No topic browser in the stack; `obsidiandynamics/kafdrop` is already pulled
   locally if one is wanted.
