@@ -119,6 +119,17 @@ CREATE OR REPLACE DIRECTORY sample_dir AS '/scripts/sample-data';
 -- byte-for-byte the source sample: all 60 distinct tags, the repeated
 -- multi-value entries (c46-c50, c99, c100, c249, c250) and the Arabic
 -- account titles all survive.
+--
+-- The key (RECID) is read from this sample file's row/@id attribute
+-- rather than hardcoded, purely so this block isn't tied to one literal
+-- string. This is a LAB CONVENIENCE, not a rule of the real system: per
+-- sample-data/account_oracle_schema.md, RECID has no DATA_DEFAULT at all
+-- (unlike CURRENCY, CATEGORY, etc., which are computed from the XML via
+-- EXTRACTVALUE). RECID is stored independently of XMLRECORD in production
+-- - it only happens to equal row/@id in this one sample file because
+-- whoever prepared it chose to set it that way. A real ingestion process
+-- would already have RECID from its actual source, not by parsing it back
+-- out of the XML.
 DECLARE
     v_clob  CLOB;
     v_bfile BFILE := BFILENAME('SAMPLE_DIR', 'account_xml_data_sample.xml');
@@ -126,6 +137,7 @@ DECLARE
     v_src   INTEGER := 1;
     v_lang  INTEGER := 0;
     v_warn  INTEGER;
+    v_recid VARCHAR2(255);
 BEGIN
     DBMS_LOB.CREATETEMPORARY(v_clob, TRUE);
     DBMS_LOB.FILEOPEN(v_bfile, DBMS_LOB.FILE_READONLY);
@@ -134,8 +146,11 @@ BEGIN
                               v_dst, v_src, 873, v_lang, v_warn);
     DBMS_LOB.FILECLOSE(v_bfile);
 
+    SELECT XMLCAST(XMLQUERY('/row/@id' PASSING XMLTYPE(v_clob) RETURNING CONTENT) AS VARCHAR2(255))
+      INTO v_recid FROM dual;
+
     MERGE INTO t24.account a
-    USING (SELECT '9000000112345001' AS recid FROM dual) s
+    USING (SELECT v_recid AS recid FROM dual) s
     ON (a.recid = s.recid)
     WHEN MATCHED THEN
         UPDATE SET a.xmlrecord = XMLTYPE(v_clob)
@@ -144,7 +159,7 @@ BEGIN
     COMMIT;
 
     DBMS_LOB.FREETEMPORARY(v_clob);
-    DBMS_OUTPUT.PUT_LINE('Loaded full sample record 9000000112345001.');
+    DBMS_OUTPUT.PUT_LINE('Loaded record ' || v_recid || ' from sample file.');
 END;
 /
 

@@ -295,25 +295,50 @@ an array, not a scalar.
 
 ---
 
-## Testing CDC manually — `test-insert-cdc.sql`
+## Testing CDC manually
 
-Inserts a fresh copy of the real sample record under a new, timestamped
-`RECID`, so you can watch a brand-new row travel from Oracle to Kafka without
-touching the seed row. Not idempotent on purpose — every run creates another
-new row, so every run is a visible, distinct event.
+Three scripts, one per operation type, all living in `tests/` and all run
+the same way — against XEPDB1, via `docker exec`:
 
 ```powershell
-docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/test-insert-cdc.sql"
+docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/tests/<script>.sql"
 ```
 
-Then read the topic to see it arrive:
+| Script | Operation | Event you should see |
+| --- | --- | --- |
+| `tests/test-insert-cdc.sql` | Inserts a fresh copy of the sample record under a new, timestamped `RECID` | `op=c` |
+| `tests/test-update-cdc.sql` | Sets a new random working balance (`c27`) on the seed row (`RECID 9000000112345001`) | `op=u` |
+| `tests/test-delete-cdc.sql` | Deletes the most recently inserted test row (never the seed row) | `op=d`, then a tombstone |
+
+Then read the topic to see events arrive:
 
 ```powershell
 docker exec cdc-kafka /opt/kafka/bin/kafka-console-consumer.sh `
   --bootstrap-server localhost:9092 --topic t24.T24.ACCOUNT --from-beginning --timeout-ms 20000
 ```
 
-Look for `"op":"c"` (create) with the `RECID` the script printed.
+Verified running all three in sequence (insert → update → delete):
+
+```
+op=u  recid=9000000112345001                 c27=16868.36   (test-update-cdc.sql)
+op=c  recid=9000000112345001-144539-170      c27=24178.54   (test-insert-cdc.sql)
+op=d  recid=9000000112345001-144539-170                     (test-delete-cdc.sql)
+      recid=9000000112345001-144539-170      -> tombstone (null value)
+```
+
+Re-verified after moving all three scripts into their own `tests/` folder —
+same sequence, same result, run via `@/scripts/tests/<script>.sql` instead
+of `@/scripts/<script>.sql`.
+
+A delete produces **two** Kafka messages: the `op=d` event itself (last known
+row content), then a separate tombstone message — same key, `null` value —
+which tells downstream consumers to drop any cached copy of that key.
+
+`test-update-cdc.sql` overwrites the seed row's content (a new random
+balance each run) — re-run `oracle-setup.sql` afterward if you want the
+original sample values back. `test-delete-cdc.sql` only ever targets rows
+matching the `test-insert-cdc.sql` naming pattern, so the seed row itself is
+never at risk of being deleted by it.
 
 ### A stale-offset failure found while testing this
 

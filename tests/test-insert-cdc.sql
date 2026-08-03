@@ -3,7 +3,7 @@
 -- =====================================================================
 -- Run against XEPDB1 (see setup.ps1's Invoke-SqlFile for the same
 -- connection pattern):
---   docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/test-insert-cdc.sql"
+--   docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/tests/test-insert-cdc.sql"
 --
 -- Loads the same real sample XML (sample-data/account_xml_data_sample.xml)
 -- under a new RECID, so the inserted row is a faithful copy of production
