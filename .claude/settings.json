@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec *)",
+      "PowerShell('--- connect log tail ---')",
+      "PowerShell(docker exec cdc-oracle sh -c \"ls -la /scripts | head -20\")",
+      "PowerShell(docker exec cdc-oracle sh -c \"ls /scripts/ | grep tmp\")",
+      "PowerShell($s = Invoke-RestMethod 'http://localhost:8083/connectors/test-account-real/status'; \"connector: $\\($s.connector.state\\)\"; $s.tasks | ForEach-Object { \"task $\\($_.id\\): $\\($_.state\\)\"; if\\($_.trace\\){ \\($_.trace -split \"`n\" | Select-Object -First 12\\) -join \"`n\" } })",
+      "PowerShell(docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list)",
+      "PowerShell(docker exec cdc-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic t24.T24.ACCOUNT_REAL --from-beginning --max-messages 1 --timeout-ms 20000 2>$null | Out-File -Encoding utf8 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\event.json'; \\(Get-Content 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\event.json' -Raw\\).Length)",
+      "PowerShell(docker exec cdc-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic t24.T24.ACCOUNT_REAL --from-beginning --timeout-ms 25000 2>$null | Out-File -Encoding utf8 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\events2.txt'; \\(Get-Content 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\events2.txt'\\).Count)",
+      "PowerShell(Invoke-RestMethod -Method Delete 'http://localhost:8083/connectors/test-account-real')",
+      "PowerShell(Invoke-RestMethod -Method Delete 'http://localhost:8083/connectors/test-clean')",
+      "PowerShell('cleaned')"
+    ]
+  }
+}
