@@ -126,7 +126,78 @@ services:
     volumes:
       - risingwave-data:/risingwave/data
 
+  # ---------------------------------------------------------------------
+  # Superset's own metadata database (dashboards, charts, users)
+  # ---------------------------------------------------------------------
+  # Separate from RisingWave on purpose: this holds Superset's internal
+  # bookkeeping, not any T24 data. RisingWave is what Superset will query
+  # to build charts, connected as a data source after first login - see
+  # README.md, Step 6.
+  superset-db:
+    image: postgres:16-alpine
+    container_name: cdc-superset-db
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+      POSTGRES_DB: superset
+    volumes:
+      - superset-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Superset - BI / reporting on top of RisingWave
+  # ---------------------------------------------------------------------
+  # The base image ships with NO Postgres driver (verified: `import
+  # psycopg2` fails out of the box) and NO default superset_config.py.
+  # Both are needed to reach RisingWave, which speaks the Postgres wire
+  # protocol. Fixed here without a custom Dockerfile:
+  #   - entrypoint -> docker-bootstrap.sh (present in the image but unused
+  #     by its default CMD) + DATABASE_DIALECT=postgres makes it install
+  #     the postgres driver on every boot, before starting the app.
+  #   - command app-gunicorn runs the exact same gunicorn launch as the
+  #     image's own default CMD (diffed identical: /usr/bin/run-server.sh
+  #     vs /app/docker/entrypoints/run-server.sh) - only the wrapper
+  #     around it changes, not how the app itself starts.
+  #   - ./superset/superset_config.py is mounted at /app/pythonpath, which
+  #     IS the image's PYTHONPATH but ships empty - this is what sets
+  #     SECRET_KEY and points Superset at superset-db for its own storage.
+  #
+  # First-time setup (schema migration + admin user) is NOT automated here
+  # - same "infra up, app setup is a deliberate manual step" pattern as
+  # oracle-connector.json and risingwave-setup.sql elsewhere in this
+  # project. See README.md, Step 6, for the one-time init command.
+  superset:
+    image: apache/superset:latest
+    container_name: cdc-superset
+    # Verified: the image runs as user "superset" (uid 1000) by default, but
+    # docker-bootstrap.sh's driver install only runs when whoami = root - it
+    # silently skips otherwise (no error), which is what happened on the
+    # first attempt here. Overriding back to root is what makes the
+    # DATABASE_DIALECT trick above actually take effect.
+    user: root
+    entrypoint: /app/docker/docker-bootstrap.sh
+    command: ["app-gunicorn"]
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      risingwave:
+        condition: service_started
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "6DKznVtdcH8QhxFbUgzc20di0UJ4IMGooSmn4BLBMwEjUUlg_pM4Xjms"
+      DATABASE_DIALECT: postgres
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-home:/app/superset_home
+
 volumes:
   oracle-data:
   kafka-data:
   risingwave-data:
+  superset-db-data:
+  superset-home:

@@ -4,13 +4,14 @@
 -- Run against XEPDB1:
 --   docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/tests/test-update-cdc.sql"
 --
--- Sets a new, random working balance (c27) on the seed row (RECID
--- 9000000112345001), using a FULL XMLTYPE replacement rather than
--- UPDATEXML. Testing showed Oracle's in-place UPDATEXML edits don't carry
--- enough redo detail for LogMiner to decode, so Debezium silently drops
--- them - a full-value SET is the only style proven to reliably produce a
--- captured op=u event (see README.md, "UPDATEXML changes are silently
--- dropped").
+-- Sets new, random values for the 3 columns the Superset dashboard reads
+-- (c23/open_actual_bal, c29/amnt_last_cr_cust, c38/amnt_last_dr_cust) on the
+-- seed row (RECID 9000000112345001), using a FULL XMLTYPE replacement
+-- rather than UPDATEXML. Testing showed Oracle's in-place UPDATEXML edits
+-- don't carry enough redo detail for LogMiner to decode, so Debezium
+-- silently drops them - a full-value SET is the only style proven to
+-- reliably produce a captured op=u event (see README.md, "UPDATEXML
+-- changes are silently dropped").
 --
 -- Re-runnable any time: each run picks a new balance, so consecutive runs
 -- are each a distinct, visible event. This does change the seed row's
@@ -27,11 +28,15 @@ DECLARE
     v_src     INTEGER := 1;
     v_lang    INTEGER := 0;
     v_warn    INTEGER;
-    v_recid   VARCHAR2(255) := '9000000112345001';
-    v_balance VARCHAR2(20);
+    v_recid            VARCHAR2(255) := '9000000112345001';
+    v_open_actual_bal  VARCHAR2(20);   -- c23
+    v_amnt_last_cr     VARCHAR2(20);   -- c29
+    v_amnt_last_dr     VARCHAR2(20);   -- c38
 BEGIN
-    -- new, visibly different balance every run
-    v_balance := TO_CHAR(ROUND(DBMS_RANDOM.VALUE(1000, 99999), 2), 'FM99999.00');
+    -- new, visibly different values every run
+    v_open_actual_bal := TO_CHAR(ROUND(DBMS_RANDOM.VALUE(1000, 99999), 2), 'FM99999.00');
+    v_amnt_last_cr    := TO_CHAR(ROUND(DBMS_RANDOM.VALUE(100, 9999), 2), 'FM9999.00');
+    v_amnt_last_dr    := TO_CHAR(-ROUND(DBMS_RANDOM.VALUE(100, 9999), 2), 'FM9999.00');
 
     DBMS_LOB.CREATETEMPORARY(v_clob, TRUE);
     DBMS_LOB.FILEOPEN(v_bfile, DBMS_LOB.FILE_READONLY);
@@ -39,8 +44,10 @@ BEGIN
                               v_dst, v_src, 873 /*AL32UTF8*/, v_lang, v_warn);
     DBMS_LOB.FILECLOSE(v_bfile);
 
-    -- swap the working balance (c27) inside the loaded document
-    v_clob := REGEXP_REPLACE(v_clob, '<c27>[^<]*</c27>', '<c27>' || v_balance || '</c27>');
+    -- swap the 3 dashboard columns inside the loaded document
+    v_clob := REGEXP_REPLACE(v_clob, '<c23>[^<]*</c23>', '<c23>' || v_open_actual_bal || '</c23>');
+    v_clob := REGEXP_REPLACE(v_clob, '<c29>[^<]*</c29>', '<c29>' || v_amnt_last_cr    || '</c29>');
+    v_clob := REGEXP_REPLACE(v_clob, '<c38>[^<]*</c38>', '<c38>' || v_amnt_last_dr    || '</c38>');
 
     UPDATE t24.account
        SET xmlrecord = XMLTYPE(v_clob)
@@ -54,7 +61,10 @@ BEGIN
     COMMIT;
     DBMS_LOB.FREETEMPORARY(v_clob);
 
-    DBMS_OUTPUT.PUT_LINE('Updated ' || v_recid || ' - new working balance (c27): ' || v_balance);
+    DBMS_OUTPUT.PUT_LINE('Updated ' || v_recid || ':');
+    DBMS_OUTPUT.PUT_LINE('  open_actual_bal  (c23) = ' || v_open_actual_bal);
+    DBMS_OUTPUT.PUT_LINE('  amnt_last_cr_cust(c29) = ' || v_amnt_last_cr);
+    DBMS_OUTPUT.PUT_LINE('  amnt_last_dr_cust(c38) = ' || v_amnt_last_dr);
     DBMS_OUTPUT.PUT_LINE('Watch topic t24.T24.ACCOUNT for an op=u (update) event.');
 END;
 /

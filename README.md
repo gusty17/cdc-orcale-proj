@@ -598,6 +598,82 @@ throughout.
 
 ---
 
+## Step 6 — Superset, for reports on top of RisingWave
+
+`docker-compose.yml` adds two services: `superset-db` (Superset's own
+metadata — dashboards, charts, users; separate from RisingWave, which holds
+the actual T24 data) and `superset` itself, on port 8088.
+
+### Two problems found and fixed before it would even boot
+
+**No Postgres driver in the base image.** `import psycopg2` fails out of the
+box — confirmed directly in the image before touching compose. Reaching
+RisingWave (Postgres wire protocol) needs it. Fixed without a custom
+Dockerfile: `entrypoint: /app/docker/docker-bootstrap.sh` (present in the
+image but unused by its own default `CMD`) + `DATABASE_DIALECT: postgres`
+makes it run `pip install -e .[postgres]` on every boot, before starting the
+app. Confirmed identical app behavior either way — `/usr/bin/run-server.sh`
+(the image's real default) and `/app/docker/entrypoints/run-server.sh`
+(what `docker-bootstrap.sh`'s `app-gunicorn` case calls) diffed byte-identical.
+
+**The driver install silently did nothing on the first attempt.** Container
+booted, then crashed with the exact same `ModuleNotFoundError: No module
+named 'psycopg2'` — the install step never ran. Cause: the image runs as a
+non-root `superset` user by default, and `docker-bootstrap.sh`'s install
+step is gated on `whoami = root`; it skips silently otherwise, no error, no
+log line. Fixed with `user: root` on the service. Re-verified: log then
+showed `Installing postgres requirements` → `psycopg2-binary==2.9.9`
+installed → worker booted clean.
+
+**No default `superset_config.py` exists in the image either** — confirmed
+empty on inspection. `superset/superset_config.py` is mounted at
+`/app/pythonpath/superset_config.py` (the image's actual `PYTHONPATH`) to
+supply `SECRET_KEY` (from `SUPERSET_SECRET_KEY`, not hardcoded — signs
+session cookies, so a value checked into the repo would defeat the point)
+and point `SQLALCHEMY_DATABASE_URI` at `superset-db`.
+
+### One-time setup (not automated — same pattern as the connector/RisingWave steps)
+
+```bash
+docker exec cdc-superset superset db upgrade
+docker exec cdc-superset superset fab create-admin \
+  --username admin --firstname Admin --lastname User \
+  --email admin@example.com --password admin
+docker exec cdc-superset superset init
+```
+
+### Connecting to RisingWave
+
+Log in at `http://localhost:8088` (`admin` / `admin`), then **Settings →
+Database Connections → + Database**, SQLAlchemy URI:
+
+```
+postgresql+psycopg2://root:@risingwave:4566/dev
+```
+
+(`risingwave`, not `localhost` — Superset reaches it over the compose
+network, same hostname every other service uses.)
+
+### Verified end to end
+
+Confirmed the whole chain works, not just that the container stays up — API
+login, connection test, and a real SQL Lab query against live T24 data, all
+through Superset's own API:
+
+```json
+{"status": "success", "data": [
+  {"recid": "9000000112345001", "customer": "90000001",
+   "currency": "EGP", "working_balance": "24178.54"}
+]}
+```
+
+From here, any chart/dashboard built in Superset's UI against the
+`RisingWave` connection is querying real, continuously-updating T24 data —
+the same pipeline verified throughout this whole project, now with a
+reporting layer on top.
+
+---
+
 ## Not done yet
 
 - Typed columns — everything in `t24_account_columns` is `VARCHAR`. T24 dates
@@ -607,3 +683,6 @@ throughout.
   and it relies on Kafka consumer-group offsets to resume.
 - No topic browser in the stack; `obsidiandynamics/kafdrop` is already pulled
   locally if one is wanted.
+- Superset's `superset-db` uses a fixed dev password (`superset`/`superset`)
+  and `SUPERSET_SECRET_KEY` is committed in `docker-compose.yml` — fine for
+  this lab, not for anything internet-facing.
