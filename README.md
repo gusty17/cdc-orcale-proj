@@ -8,10 +8,12 @@ Oracle XE 21c  ──redo/archived redo──▶  Debezium (Kafka Connect)  ─�
    T24.ACCOUNT                              LogMiner adapter          t24.T24.ACCOUNT      t24_account
 ```
 
-Current status: **steps 1-4 are done** — Oracle is configured for CDC, the
-container stack runs (including RisingWave), the connector is deployed, and
-change events flow end-to-end from Oracle into a live, queryable RisingWave
-table.
+Current status: **steps 1-6 are done** — Oracle is configured for CDC, the
+container stack runs (Kafka, Connect, RisingWave, Superset), the connector is
+deployed, and change events flow end-to-end from Oracle into RisingWave —
+both as a raw table and as 165 flattened business columns, the latter
+computed entirely in RisingWave SQL with no external process — with a
+reporting layer (Superset) on top.
 
 ---
 
@@ -512,89 +514,122 @@ docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhos
 
 ---
 
-## Step 5 — Flattening the XML into real columns (`flatten/`)
+## Step 5 — Flattening the XML into real columns, natively in RisingWave
 
-`t24_account` stores `xmlrecord` as one opaque string. `flatten/` splits it
-into named business columns in a separate RisingWave table.
+`t24_account` stores `xmlrecord` as one opaque string. `t24_account_columns`
+(built in `risingwave-setup.sql`) splits it into 165 named business columns —
+computed **entirely inside RisingWave SQL**. No external process reads Kafka
+to produce it; RisingWave's own engine keeps it live, same as `t24_account`
+and `t24_account_audit`.
 
-**Why Python and not SQL:** RisingWave has **no XML functions at all** —
-`rw_catalog.rw_functions` returns zero rows for anything XML/XPath. Parsing
-had to happen outside the database.
+This replaces an earlier Python-based version (`flatten/`, kept in the repo
+for reference, no longer running) — rebuilt per a specific requirement: the
+XML→columns transformation had to live in RisingWave itself, with the tag
+lookup table also stored as a real RisingWave table, joined against every
+row. See "Superseded: the Python version" below for what changed and why.
 
-```powershell
-pip install -r flatten/requirements.txt
+### RisingWave has no XML functions — so this is regex, not XML parsing
 
-python flatten/generate_schema.py         # sample XML + lookup CSV -> DDL + column map
-# apply flatten/create_table.sql to RisingWave, then:
-python flatten/consume_to_risingwave.py --from-beginning --idle-exit 15
+Confirmed directly: `rw_catalog.rw_functions` returns zero rows for anything
+XML/XPath. The whole pipeline works around that in three stages, each
+verified independently before combining:
+
+**1. Unpivot** — explode each row's XML into one row per tag, using
+`regexp_matches(..., 'g')` in a `LATERAL` subquery (confirmed: RisingWave's
+parser needs the subquery wrapper — a bare `LATERAL regexp_matches(...)`
+without one is rejected):
+
+```sql
+SELECT recid, m[1] AS field, m[2] AS position, m[3] AS value
+  FROM t24_account,
+       LATERAL (SELECT regexp_matches(xmlrecord, '<(c\d+)(?:\s+m="(\d+)")?>([^<]*)</\1>', 'g') AS m) AS t
 ```
 
-### Three tag shapes, three mapping rules
+**2. Resolve** — `LEFT JOIN` against `lookup_metadata`, a real RisingWave
+table loaded from `sample-data/lookup_metadata.csv` (289 rows). `COPY`
+doesn't work here — confirmed directly, RisingWave's parser rejects both
+`COPY ... WITH (FORMAT csv, ...)` and plain `COPY ... CSV HEADER` — so it's
+loaded via a generated bulk `INSERT` instead.
 
-`lookup_metadata.csv` (289 rows / 256 fields, no name collisions) describes
-three genuinely different shapes, and the generator handles each:
+**3. Pivot** — fold back to wide columns via
+`MAX(CASE WHEN column_name = '...' THEN value END)`, one branch per column.
 
-| Shape | Example | Becomes |
+### Three tag shapes, one join, two naming rules
+
+| Shape | Example | Resolved via |
 | --- | --- | --- |
-| Scalar | `c1` occurs once | `customer` |
-| **`c20` = T24 LOCAL.REF** | each position is a *different* field | `m=4` → `arabic_title`, `m=32` → `nab_flag` |
-| True array | `c47` repeats the same field | `cap_date_cr_int_01` … `_23` |
+| Scalar | `c1` occurs once | Base name straight from the lookup join |
+| **`c20` = T24 LOCAL.REF** | each position is a *different* field | Exact `(field_index, m_index)` match wins — `m=4` → `arabic_title` |
+| True array | `c47` repeats the same field | Base name + `LPAD(position, 2, '0')`, only for the 9 fields flagged `is_multivalue` |
 
-Rule: an exact `(field, position)` row in the lookup wins; otherwise use the
-base name, numbered only when the field actually repeats. Result for this
-sample: **166 columns** (recid + 165).
+The 9 array fields (`c46`–`c50`, `c99`, `c100`, `c249`, `c250`) only have a
+single base row in the CSV — no per-position row like `c20` has — so the
+numbering has to be computed in the `resolved` CTE, not looked up directly.
+`is_multivalue` on `lookup_metadata` carries that distinction.
 
 Parallel arrays stay aligned — `alt_acct_type_02` = `T24.IBAN` pairs with
 `alt_acct_id_02` = `EG00ANON…`.
 
-**Positions are collected as a set, not a max.** `c20` occupies positions
-`1,2,3,4,32` in the sample — sparse, not contiguous. Generating
-`range(1, max+1)` produced 32 `c20` columns when only 5 could ever hold data,
-inventing 27 always-NULL columns for `m=5..31` (`hold_details`, `ac_amt_loc`,
-`email_address`, …) — which contradicted the whole "only tags present"
-premise. Iterating observed positions instead dropped the schema from 192
-columns to 165 with no data loss. True arrays are unaffected: `c47`'s
-positions really are contiguous `1..23`.
+### Why `MATERIALIZED VIEW`, and two real bugs found building this
 
-### Schema is sample-derived, and says so when that hurts
+Same reasoning already proven for `t24_account_audit`: a plain
+`CREATE TABLE ... AS SELECT` freezes at creation and never updates again
+(confirmed earlier with `t24_account_audit_ctas`); a plain `VIEW` stays live
+but re-runs the whole regex/join/pivot on every query. `MATERIALIZED VIEW`
+gets both.
 
-The schema comes from tags **present in the sample**, not all 256 lookup
-fields — so `mnemonic` (`c6`), `posting_restrict` (`c13`) and
-`int_no_booking` (`c17`) have no column. The consumer therefore **warns
-loudly** on any unmapped tag or array position past the cap rather than
-dropping it silently. Re-run `generate_schema.py` against a richer sample to
-widen the schema.
+**Bug 1 — `DROP TABLE`/`DROP MATERIALIZED VIEW IF EXISTS` is not a graceful
+no-op on a type mismatch.** Confirmed directly: dropping an object with
+`DROP TABLE IF EXISTS` when it actually exists as a materialized view
+*errors* (`Use DROP MATERIALIZED VIEW to drop a materialized view`) rather
+than silently skipping — and the reverse is equally true. Since the
+migration away from the old plain-`TABLE` Python-fed version only ever
+matters once, that one-time step is documented as a manual note in
+`risingwave-setup.sql` rather than automated — no single `DROP` statement
+can stay silent across both possible prior states.
 
-### RisingWave write semantics — verified, and one of them caused a real bug
+**Bug 2 — drop ordering.** RisingWave refuses to drop a table a materialized
+view still depends on (`table used by 1 other objects` — confirmed
+directly), so `t24_account_columns` must be dropped *before*
+`lookup_metadata` is rebuilt, even though recreating it comes *after*.
 
-| Behaviour | Consequence |
-| --- | --- |
-| `INSERT` on an existing PK **upserts** | Debezium `r`/`c`/`u` all map to plain `INSERT` |
-| `DELETE` works normally | `op=d` maps to `DELETE` |
-| **Writes are invisible until `FLUSH`** | every batch must end with one |
+### Verified end to end, including a full clean rebuild from zero
 
-That last one produced a genuine bug on the first run: the flattened table
-ended up with **7 rows against Oracle's 1**. Batching INSERTs and DELETEs
-into a single flush meant `DELETE ... WHERE recid = X` ran *before* the
-matching INSERT was visible, matched nothing, and the row survived.
-
-Fix wasn't just an extra `FLUSH` — the consumer now collapses each `recid` to
-its **final** operation within a batch, so a row can never be both upserted
-and deleted in one flush. Re-run afterwards: 12 upserts collapsed to 1, and
-the table matched `t24_account` exactly.
-
-### Verified end to end
-
-Live insert / update / delete against Oracle, each picked up correctly:
+Confirmed matching every field already validated in the earlier Python
+version — scalars, `c20` LOCAL.REF, true arrays, Arabic text:
 
 ```
-recid            | customer | currency | working_balance | co_code   | arabic_title
-9000000112345001 | 90000001 | EGP      | 24178.54        | EG0010039 | عميل تجريبي مجهول
+customer=90000001  arabic_title=عميل تجريبي مجهول  cap_date_cr_int_23=20240930
+alt_acct_id_02=EG00ANON000000000000000000000  co_code=EG0010039
 ```
 
-An update that omitted `c78` correctly set `opening_date` back to `NULL`,
-and a delete removed the row — flattened table stayed in step with Oracle
-throughout.
+Then re-verified with **zero Python running at any point**:
+- A live `UPDATE` in Oracle appeared automatically — values matched exactly.
+- A live `INSERT` then `DELETE` both propagated correctly.
+- The whole `risingwave-setup.sql` re-run three times in a row against
+  already-populated state — zero errors after the two bugs above were fixed.
+- The RisingWave data volume was wiped completely and the file re-run from
+  absolute zero — table, lookup data, and materialized view all rebuilt
+  correctly, then a fresh insert/delete cycle confirmed still worked.
+
+### Superseded: the Python version (`flatten/`)
+
+Kept in the repo for reference. It worked (verified extensively at the
+time), and the bugs found building it were real and are still relevant
+lessons about RisingWave's write semantics — but it's no longer part of the
+running pipeline. What it caught, in case they resurface elsewhere:
+
+- **`INSERT` on an existing PK upserts** in RisingWave — Debezium `r`/`c`/`u`
+  all map to plain `INSERT`; `DELETE` maps to `DELETE`.
+- **Writes are invisible until `FLUSH`.** Batching INSERTs and DELETEs into
+  one flush caused a real bug: `DELETE ... WHERE recid = X` ran *before* the
+  matching INSERT was visible, matched nothing, row survived — table ended
+  up with 7 rows against Oracle's 1. Fixed by collapsing each `recid` to its
+  final operation per batch.
+- Schema was derived from tags **present in the sample**, not all 256
+  lookup fields, so `mnemonic`/`posting_restrict`/`int_no_booking` had no
+  column — same limitation the native version inherits, since both read the
+  same sample.
 
 ---
 
@@ -679,8 +714,6 @@ reporting layer on top.
 - Typed columns — everything in `t24_account_columns` is `VARCHAR`. T24 dates
   are `YYYYMMDD` strings and amounts are decimal strings; casting them needs
   per-field type rules that aren't in `lookup_metadata.csv`.
-- The consumer is a standalone script, not a service — no restart supervision,
-  and it relies on Kafka consumer-group offsets to resume.
 - No topic browser in the stack; `obsidiandynamics/kafdrop` is already pulled
   locally if one is wanted.
 - Superset's `superset-db` uses a fixed dev password (`superset`/`superset`)
