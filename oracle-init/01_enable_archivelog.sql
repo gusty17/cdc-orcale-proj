@@ -1,16 +1,10 @@
--- =====================================================================
 -- Mounted into /container-entrypoint-startdb.d - runs on every container
--- start, as SYSDBA over a local (bequeath) connection.
--- =====================================================================
--- gvenzl/oracle-xe:21 has no ENABLE_ARCHIVELOG env var (that only exists
--- on the newer gvenzl/oracle-free images), and ARCHIVELOG can only be
--- turned on while the database is in MOUNT state - which the entrypoint
--- has already moved past by the time the DB is reachable.
---
--- So: detect the mode, and only when it is NOARCHIVELOG generate + run
--- the restart sequence. Once enabled it is recorded in the control file,
--- so every later start is a no-op that costs one query.
--- =====================================================================
+-- start, as SYSDBA. gvenzl/oracle-xe:21 has no ENABLE_ARCHIVELOG env var,
+-- and ARCHIVELOG can only be enabled in MOUNT state, which the entrypoint
+-- has already passed by the time the DB is reachable - so this checks the
+-- current mode and only runs the shutdown/mount/enable/open sequence when
+-- it's actually needed. Once enabled it's permanent, so every later start
+-- is a one-query no-op.
 
 SET HEADING OFF
 SET FEEDBACK OFF

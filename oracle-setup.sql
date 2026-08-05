@@ -48,16 +48,13 @@ PROMPT ============================================================
 --
 -- Every business field (currency, balances, customer, dates, ...) lives
 -- inside the XML as c1, c2, c8, ... - see sample-data/lookup_metadata.csv
--- for the c-number -> business-name mapping. Nothing is projected out into
--- its own column here: extraction is a downstream concern.
+-- for the c-number -> business-name mapping. Extraction happens downstream
+-- (risingwave-setup.sql), not here.
 --
--- Note on the real source table: it additionally declares 9 VIRTUAL
--- columns (CURRENCY, CATEGORY, CUSTOMER, ...) that run EXTRACTVALUE over
--- the XML at read time. They store nothing, produce no redo, and Debezium
--- streams the text of their defining expression instead of a value - so
--- oracle-connector.json pins column.include.list to RECID|XMLRECORD. That
--- guard stays in place even though this table has no virtual columns to
--- exclude, because the production table does.
+-- The real production table also has 9 VIRTUAL columns computed from the
+-- XML via EXTRACTVALUE. They store nothing and produce no redo, so
+-- Debezium can't read their values - oracle-connector.json's
+-- column.include.list excludes them for this reason.
 DECLARE
     v_cnt PLS_INTEGER;
 BEGIN
@@ -116,20 +113,11 @@ PROMPT ============================================================
 CREATE OR REPLACE DIRECTORY sample_dir AS '/scripts/sample-data';
 
 -- Loaded straight from the file rather than typed inline, so the row is
--- byte-for-byte the source sample: all 60 distinct tags, the repeated
--- multi-value entries (c46-c50, c99, c100, c249, c250) and the Arabic
--- account titles all survive.
---
--- The key (RECID) is read from this sample file's row/@id attribute
--- rather than hardcoded, purely so this block isn't tied to one literal
--- string. This is a LAB CONVENIENCE, not a rule of the real system: per
--- sample-data/account_oracle_schema.md, RECID has no DATA_DEFAULT at all
--- (unlike CURRENCY, CATEGORY, etc., which are computed from the XML via
--- EXTRACTVALUE). RECID is stored independently of XMLRECORD in production
--- - it only happens to equal row/@id in this one sample file because
--- whoever prepared it chose to set it that way. A real ingestion process
--- would already have RECID from its actual source, not by parsing it back
--- out of the XML.
+-- byte-for-byte the source sample (all tags, multi-value entries, Arabic
+-- text included). RECID is read from the file's row/@id attribute rather
+-- than hardcoded - a lab convenience only: in production RECID is stored
+-- independently of XMLRECORD (no DATA_DEFAULT from the XML, unlike the
+-- virtual columns), it just happens to match row/@id in this one sample.
 DECLARE
     v_clob  CLOB;
     v_bfile BFILE := BFILENAME('SAMPLE_DIR', 'account_xml_data_sample.xml');

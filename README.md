@@ -719,3 +719,10 @@ reporting layer on top.
 - Superset's `superset-db` uses a fixed dev password (`superset`/`superset`)
   and `SUPERSET_SECRET_KEY` is committed in `docker-compose.yml` — fine for
   this lab, not for anything internet-facing.
+
+
+
+
+logs data -->/opt/oracle/homes/OraDBHome21cXE/dbs/
+t24 tables --> /opt/oracle/oradata/XE/XEPDB1/users01.dbf
+ 

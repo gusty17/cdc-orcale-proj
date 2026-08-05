@@ -14,13 +14,13 @@
     "topic.prefix": "t24",
     "table.include.list": "T24\\.ACCOUNT",
 
-    "//": "Capture ONLY the two physically stored columns. The other 9 are virtual: LogMiner emits the text of their defining expression instead of a value, so without this they arrive as garbage on every update.",
+    "//": "Only the 2 physically stored columns - the other 9 are virtual and arrive as garbage text without this filter.",
     "column.include.list": "T24\\.ACCOUNT\\.(RECID|XMLRECORD)",
 
-    "//lob": "Required - XMLRECORD is XMLTYPE, stored as a hidden BLOB. Without this the XML never arrives.",
+    "//lob": "Required - XMLRECORD is XMLTYPE, stored as a hidden BLOB.",
     "lob.enabled": "true",
 
-    "//strategy": "online_catalog reads the live data dictionary. The default (redo_log_catalog) dumps the dictionary into the redo stream and does not surface a change until its log is archived - on XE's two 10MB groups that means an idle table sits unmined indefinitely. Trade-off: online_catalog cannot track DDL changes to the captured table, which is fine for a fixed RECID/XMLRECORD shape.",
+    "//strategy": "online_catalog avoids waiting on log archival to see changes (default redo_log_catalog can stall indefinitely on XE's small redo logs). Trade-off: can't track DDL on the captured table - fine here.",
     "log.mining.strategy": "online_catalog",
 
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",

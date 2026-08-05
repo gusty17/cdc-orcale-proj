@@ -1,26 +1,17 @@
--- =====================================================================
--- RisingWave - consume the Debezium topic straight into a live table
--- =====================================================================
--- Connect with any Postgres client (RisingWave speaks the Postgres wire
--- protocol on 4566):
+-- RisingWave - consume the Debezium topic straight into a live table.
+-- Connect with any Postgres client (wire protocol on 4566):
 --   psql -h localhost -p 4566 -d dev -U root
---   -- or, if you don't have psql installed locally, run it from a
---   -- throwaway container on the same docker network:
+--   -- or, without a local psql, from a throwaway container on the network:
 --   docker run --rm --network cdc-oracle_default postgres:16-alpine \
 --     psql -h risingwave -p 4566 -d dev -U root -f /dev/stdin < risingwave-setup.sql
 --
--- CREATE TABLE (not CREATE SOURCE) is used so RisingWave actually stores
--- and maintains the data as a queryable changelog table, applying every
--- insert/update/delete it reads from Kafka - a plain CREATE SOURCE would
--- only let you query the raw stream, not a materialized current state.
+-- CREATE TABLE (not CREATE SOURCE) so RisingWave stores and maintains a
+-- queryable current-state table, applying every Kafka change as it
+-- arrives - a SOURCE would only expose the raw stream.
 --
--- FORMAT DEBEZIUM ENCODE JSON tells RisingWave to unwrap Debezium's
--- {op, before, after, source, ...} envelope automatically and apply each
--- change (insert/update/delete) against PRIMARY KEY (recid) - this is
--- why the connector's key.converter must actually emit {"RECID": "..."}
--- as the Kafka message key (see oracle-connector.json), since Debezium
--- format in RisingWave uses the key to identify which row to update.
--- =====================================================================
+-- FORMAT DEBEZIUM ENCODE JSON unwraps Debezium's {op, before, after, ...}
+-- envelope and applies each change against PRIMARY KEY (recid), matched
+-- via the Kafka message key.
 
 CREATE TABLE IF NOT EXISTS t24_account (
     recid     VARCHAR,
@@ -33,20 +24,12 @@ CREATE TABLE IF NOT EXISTS t24_account (
     scan.startup.mode = 'earliest'
 ) FORMAT DEBEZIUM ENCODE JSON;
 
--- =====================================================================
--- Audit / event log - every change, not just current state
--- =====================================================================
--- t24_account above only shows "what does the row look like right now" -
--- FORMAT DEBEZIUM collapses history away by applying each change over the
--- primary key. To see every operation (before, after, when), read the
--- SAME topic a second time with FORMAT PLAIN instead: it does not apply
--- inserts/updates/deletes against a key, it just appends every message as
--- its own permanent row - nothing here is ever overwritten or removed.
---
--- before/after/source are kept as JSONB rather than pre-extracted columns,
--- so this table survives if T24's columns ever change - t24_account_audit
--- below is what does the field extraction, and can be adjusted without
--- re-reading the topic from scratch.
+-- Audit / event log - every change, not just current state. t24_account
+-- only shows the row's current state; reading the SAME topic again with
+-- FORMAT PLAIN (instead of DEBEZIUM) appends every message as its own
+-- permanent row instead of collapsing history over the primary key.
+-- before/after/source stay as JSONB so this table survives T24 field
+-- changes; extraction into named columns happens downstream.
 CREATE TABLE IF NOT EXISTS t24_account_events (
     op       VARCHAR,
     "before" JSONB,
@@ -60,145 +43,13 @@ CREATE TABLE IF NOT EXISTS t24_account_events (
     scan.startup.mode = 'earliest'
 ) FORMAT PLAIN ENCODE JSON;
 
--- Readable view: operation type, before/after content, and two different
--- "when" columns -
---   db_commit_time  - source->>'ts_ms', when the change actually committed
---                     in Oracle (from the redo log itself)
---   captured_time   - top-level ts_ms, when Debezium/Kafka processed it
--- These differ by however long mining + streaming lag adds - usually a
--- few seconds in this lab.
---
--- before_xmlrecord is RECONSTRUCTED, not taken from Debezium's own
--- "before" field. XMLRECORD is a LOB (XMLTYPE); Oracle's redo log never
--- carries LOB before-images, so Debezium's before.XMLRECORD is always the
--- literal string '__debezium_unavailable_value' on UPDATE/DELETE -
--- confirmed by testing, not a hypothetical, and there is no Oracle-side
--- setting that fixes it. Instead, since t24_account_events already keeps
--- every version of every row forever, the real prior XML is simply the
--- previous row's "after" value - LAG() reconstructs it with no change to
--- Oracle or T24's schema needed.
---
--- Tested: insert -> update -> update produced the correct chain
--- (ROUND-ONE -> ROUND-TWO), not the placeholder. Only limitation: a row's
--- very first version (its INSERT/SNAPSHOT) has no prior row to reconstruct
--- from, so before_xmlrecord is genuinely NULL there - which is correct,
--- since no earlier version exists.
---
--- MATERIALIZED (not a plain view, not CREATE TABLE ... AS SELECT):
---   - CREATE TABLE ... AS SELECT was tested directly and confirmed to take
---     a ONE-TIME snapshot that never updates again - a fresh insert in
---     Oracle never appeared in it. Wrong choice for something meant to
---     keep growing forever.
---   - A plain CREATE VIEW stays live (re-runs the query each time), but
---     has no storage of its own - it recomputes the whole LAG() over
---     t24_account_events on every single query, which gets more expensive
---     as the event log grows.
---   - MATERIALIZED VIEW gets both: RisingWave's streaming engine keeps it
---     incrementally, continuously up to date in the background (confirmed:
---     a fresh insert AND a fresh update both appeared automatically, with
---     before_xmlrecord correctly reconstructed, no manual refresh), while
---     queries against it read pre-computed, stored results - same speed
---     as a table.
-CREATE MATERIALIZED VIEW IF NOT EXISTS t24_account_audit AS
-WITH base AS (
-    SELECT
-        CASE op
-            WHEN 'r' THEN 'SNAPSHOT'
-            WHEN 'c' THEN 'INSERT'
-            WHEN 'u' THEN 'UPDATE'
-            WHEN 'd' THEN 'DELETE'
-            ELSE op
-        END AS operation,
-        COALESCE("after"->>'RECID', "before"->>'RECID') AS recid,
-        "after"->>'XMLRECORD' AS after_xmlrecord,
-        to_timestamp((source->>'ts_ms')::bigint / 1000.0) AS db_commit_time,
-        to_timestamp(ts_ms / 1000.0)                       AS captured_time
-    FROM t24_account_events
-)
-SELECT
-    recid,
-    operation,
-    LAG(after_xmlrecord) OVER (PARTITION BY recid ORDER BY captured_time) AS before_xmlrecord,
-    after_xmlrecord,
-    db_commit_time,
-    captured_time
-FROM base;
-
--- =====================================================================
--- t24_account_columns - flattened XML, computed ENTIRELY in RisingWave SQL
--- =====================================================================
--- Originally built as flatten/consume_to_risingwave.py, an external Python
--- process reading Kafka directly and writing into a plain table. Rebuilt
--- here per requirement: no external process reads Kafka to produce this
--- table - RisingWave's own engine keeps it live, the same way it already
--- does for t24_account/t24_account_audit above. flatten/ is kept in the
--- repo for reference but is no longer part of the running pipeline.
---
--- Three stages, verified individually before combining:
---   1. unpivoted  - regexp_matches(xmlrecord, ..., 'g') in a LATERAL subquery
---      explodes each row's XML into one row per tag: (recid, field, position, value).
---      RisingWave has NO XML functions at all (confirmed: rw_functions has zero
---      XML/XPath entries) - this is regex-based unpivoting, not XML parsing.
---   2. resolved   - LEFT JOINs unpivoted against lookup_metadata (a real table
---      in RisingWave, loaded just above) to turn each (field, position) into
---      its real business column name. An exact match on (field_index, m_index)
---      wins (c20's LOCAL.REF, where every position is a distinct field);
---      otherwise the base name is used, numbered only for the 9 fields
---      flagged is_multivalue (true repeating arrays like c47 x23) - the CSV
---      only has one base row for those, not one row per position, so the
---      numbering has to be computed here rather than looked up directly.
---   3. the final SELECT - pivots resolved back to wide columns via
---      MAX(CASE WHEN column_name = '...' THEN value END), one branch per
---      column. The 165-column list is the exact set flatten/generate_schema.py
---      already derived and verified from the sample XML - reused as-is so
---      the column set doesn't drift from what was already tested.
---
--- MATERIALIZED, not a plain VIEW or CREATE TABLE ... AS SELECT: a plain
--- TABLE-AS-SELECT was tested and confirmed to take a one-time frozen
--- snapshot that never updates again (see README.md). A plain VIEW stays
--- live but re-runs this whole regex/join/pivot on every query. MATERIALIZED
--- VIEW keeps it both live and pre-computed - confirmed with a real insert,
--- update, and delete in Oracle, each appearing here automatically with zero
--- external process running.
---
--- Dropped here, before lookup_metadata is rebuilt below: RisingWave refuses
--- to drop a table a materialized view still depends on ("table used by 1
--- other objects" - confirmed directly), so this drop has to happen first.
--- It gets recreated at the very end of this file, once lookup_metadata
--- exists again.
---
--- ONE-TIME MIGRATION NOTE: if t24_account_columns still exists as a plain
--- TABLE from the old Python-fed version (flatten/consume_to_risingwave.py),
--- run `DROP TABLE t24_account_columns;` manually once before this script -
--- confirmed directly that RisingWave's DROP MATERIALIZED VIEW refuses to
--- touch a plain TABLE of the same name ("Use `DROP TABLE` to drop a
--- table"), it does not silently no-op like IF EXISTS normally implies.
--- Not handled automatically here because the reverse is equally true
--- (DROP TABLE IF EXISTS errors the same way against an existing
--- materialized view), so there is no single DROP statement that stays
--- silent across both possible prior states - only one of them can ever be
--- correct at a time, and after the first successful run it is always this
--- one going forward.
-DROP MATERIALIZED VIEW IF EXISTS t24_account_columns;
-
--- =====================================================================
--- Lookup metadata table - lives IN RisingWave, joined against every row
--- =====================================================================
--- Generated from sample-data/lookup_metadata.csv (289 rows). Static
--- reference data - loaded once via INSERT (RisingWave's SQL parser does not
--- accept COPY ... WITH/CSV options - confirmed directly; both syntaxes error).
---
--- is_multivalue marks the 9 fields (out of 256) that repeat with plain
--- <cN m="k"> siblings and have no per-position name of their own in the CSV
--- (unlike c20, where EVERY position has its own distinct business name).
--- Derived from scanning account_xml_data_sample.xml - see flatten/generate_schema.py
--- for the same analysis done the first time, in Python, before this rewrite.
---
--- DROP + recreate rather than IF NOT EXISTS: this is static reference data
--- with no natural single-column primary key (m_index is nullable, so it
--- can't be part of one), so there is nothing to check per-row before
--- inserting - re-running this file is only safe because it always starts
--- from empty.
+-- Static reference data mapping XML tag (+ position, for multi-value T24
+-- fields) to its real business name. Loaded from sample-data/lookup_metadata.csv.
+-- Drop + recreate rather than IF NOT EXISTS: no natural single-column key
+-- (m_index is nullable), so re-running this file is only safe if it
+-- always starts from empty. is_multivalue flags fields that repeat with
+-- <cN m="k"> siblings under one base name (e.g. cap_date_cr_int x23) -
+-- used by t24_account_columns below to number them instead of colliding.
 DROP TABLE IF EXISTS lookup_metadata;
 
 CREATE TABLE lookup_metadata (
@@ -501,6 +352,18 @@ INSERT INTO lookup_metadata (field_index, m_index, resolved_name_en, is_multival
 
 FLUSH;
 
+-- Flattens XMLRECORD into named columns, entirely in RisingWave SQL - no
+-- external process. RisingWave has no XML functions, so this is regex,
+-- not real XML parsing, in three stages:
+--   unpivoted - regexp_matches(..., 'g') in a LATERAL subquery explodes
+--     each row's XML into one row per tag: (recid, field, position, value).
+--   resolved  - joins against lookup_metadata to resolve each tag into
+--     its real column name (exact match wins for position-specific T24
+--     LOCAL.REF fields like c20; otherwise base name, numbered only when
+--     is_multivalue is true).
+--   final SELECT - pivots back to wide columns via MAX(CASE WHEN ...).
+-- MATERIALIZED so it stays live and pre-computed (a plain TABLE AS SELECT
+-- would freeze at creation; a plain VIEW would re-run this on every query).
 CREATE MATERIALIZED VIEW t24_account_columns AS
 WITH unpivoted AS (
     SELECT recid, m[1] AS field, m[2] AS position, m[3] AS value

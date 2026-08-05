@@ -1,6 +1,7 @@
 <#
     setup.ps1 - bring the whole CDC lab up: Oracle prerequisites, the
-    Debezium connector, and the RisingWave tables/views.
+    Debezium connector, and the RisingWave tables/views (including the
+    flattened t24_account_columns materialized view).
 
     Usage:
         .\setup.ps1            # start containers, then apply everything below
@@ -8,13 +9,9 @@
         .\setup.ps1 -Down      # tear everything down, volumes included
 
     Everything this script applies is idempotent, so -SqlOnly (or a plain
-    re-run) is always safe.
-
-    NOT covered here - separate tools with their own setup:
-        oracle-connector.json is applied automatically, but flatten/ (the
-        Python XML-flattening consumer) is not - it has its own dependencies
-        (pip install -r flatten/requirements.txt) and runs as a standalone,
-        long-running process. See README.md Step 5.
+    re-run) is always safe. Superset is started but not configured here -
+    its one-time init (schema migration + admin user) is manual, see
+    README.md Step 6.
 #>
 [CmdletBinding()]
 param(
@@ -158,11 +155,9 @@ if (-not $connectReady) {
 }
 
 Write-Step 'Waiting for the Kafka topic (RisingWave sources need it to already exist)'
-# The connector reporting RUNNING only means the task started - it still has
-# to run the initial snapshot before anything actually reaches Kafka.
-# Confirmed by testing: without this wait, risingwave-setup.sql's CREATE
-# TABLE ... WITH (connector='kafka', topic='t24.T24.ACCOUNT') fails with
-# "topic t24.T24.ACCOUNT not found" on a fresh stack.
+# Connector state RUNNING only means the task started, not that the initial
+# snapshot has reached Kafka yet - risingwave-setup.sql's CREATE TABLE ...
+# WITH (connector='kafka', ...) fails on a fresh stack without this wait.
 $topicReady = $false
 $deadline   = (Get-Date).AddMinutes(2)
 while ((Get-Date) -lt $deadline) {
@@ -178,14 +173,10 @@ if ($topicReady) {
 }
 
 Write-Step 'Applying RisingWave tables/views'
-# risingwave-setup.sql uses IF NOT EXISTS throughout, so piping it in on every
-# run is safe. No local psql needed - a throwaway container on the compose
-# network runs it instead (same pattern used everywhere in README.md).
-#
-# -v ON_ERROR_STOP=1 matters: psql's default is to print an error and keep
-# going, which made an earlier version of this script report success even
-# when every statement in the file had failed. This makes psql itself exit
-# non-zero on the first real error, so $LASTEXITCODE is actually meaningful.
+# No local psql needed - runs via a throwaway container on the compose
+# network. -v ON_ERROR_STOP=1 is required: psql's default is to print an
+# error and keep going, which makes $LASTEXITCODE report success even when
+# every statement failed.
 $rwSql = Get-Content (Join-Path $ProjectDir 'risingwave-setup.sql') -Raw
 $rwSql | docker run --rm -i --network $RisingWaveNet postgres:16-alpine `
     psql -h risingwave -p 4566 -d dev -U root -v ON_ERROR_STOP=1
@@ -197,7 +188,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ''
 Write-Host 'CDC pipeline is up: Oracle -> Debezium -> Kafka -> RisingWave.' -ForegroundColor Green
-Write-Host 'Optional next step (separate tool, not automated here):'
-Write-Host '  pip install -r flatten\requirements.txt'
-Write-Host '  python flatten\generate_schema.py'
-Write-Host '  python flatten\consume_to_risingwave.py --from-beginning'
+Write-Host 'Next: one-time Superset init (see README.md Step 6) to start building reports.'

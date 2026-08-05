@@ -1,20 +1,10 @@
 name: cdc-oracle
 
 services:
-  # ---------------------------------------------------------------------
-  # Oracle XE 21c - the CDC source
-  # ---------------------------------------------------------------------
-  # CDB = XE, PDB = XEPDB1. The -faststart variant ships with the database
-  # already created, so the first boot is seconds rather than minutes.
-  #
-  # Note: this image has NO ENABLE_ARCHIVELOG env var - that only exists on
-  # the newer gvenzl/oracle-free images. ARCHIVELOG is enabled instead by
-  # oracle-init/01_enable_archivelog.sql, which the image's entrypoint runs
-  # from /container-entrypoint-startdb.d on every start (idempotent).
-  #
-  # Because the faststart image already contains a database, the entrypoint
-  # treats every start as "already initialized" and never runs
-  # /container-entrypoint-initdb.d - startdb.d is the only usable hook.
+  # Oracle XE 21c - the CDC source. CDB = XE, PDB = XEPDB1. -faststart ships
+  # with the database pre-built, so it never runs /container-entrypoint-initdb.d
+  # (only used on true first-init) - startdb.d (used below for ARCHIVELOG)
+  # is the only hook that fires on every start.
   oracle:
     image: gvenzl/oracle-xe:21-slim-faststart
     container_name: cdc-oracle
@@ -33,11 +23,8 @@ services:
       retries: 30
       start_period: 60s
 
-  # ---------------------------------------------------------------------
-  # Kafka 3.8 - single node, KRaft (no ZooKeeper)
-  # ---------------------------------------------------------------------
-  # Two plaintext listeners: PLAINTEXT for containers on this network,
-  # EXTERNAL for tools on the host (localhost:29092).
+  # Kafka 3.8, single node, KRaft (no ZooKeeper). Two listeners: PLAINTEXT
+  # for containers on this network, EXTERNAL for the host (localhost:29092).
   kafka:
     image: apache/kafka:3.8.0
     container_name: cdc-kafka
@@ -68,12 +55,8 @@ services:
       retries: 20
       start_period: 20s
 
-  # ---------------------------------------------------------------------
-  # Kafka Connect (Debezium) - hosts the Oracle connector
-  # ---------------------------------------------------------------------
-  # Verified: this image already contains /kafka/connect/debezium-connector-oracle
-  # *including* ojdbc8 and orai18n, so no custom Dockerfile / driver download
-  # is needed. See README.md ("Image verification").
+  # Kafka Connect (Debezium) - hosts the Oracle connector. Ships with the
+  # Oracle driver (ojdbc8, orai18n) already bundled - no custom image needed.
   connect:
     image: quay.io/debezium/connect:3.6.0.Final
     container_name: cdc-connect
@@ -105,12 +88,9 @@ services:
       retries: 20
       start_period: 30s
 
-  # ---------------------------------------------------------------------
-  # RisingWave - streaming SQL engine, reads the Kafka topic directly
-  # ---------------------------------------------------------------------
-  # single_node mode runs meta/compute/frontend/compactor in one process -
-  # fine for a lab, not for production. Speaks the Postgres wire protocol
-  # on 4566, so any Postgres client (psql, DBeaver, etc.) can query it.
+  # RisingWave - streaming SQL engine, reads the Kafka topic directly.
+  # single_node mode (meta/compute/frontend/compactor in one process) is
+  # fine for a lab, not production. Postgres wire protocol on 4566.
   risingwave:
     image: risingwavelabs/risingwave:v2.0.5
     container_name: cdc-risingwave
@@ -126,13 +106,8 @@ services:
     volumes:
       - risingwave-data:/risingwave/data
 
-  # ---------------------------------------------------------------------
-  # Superset's own metadata database (dashboards, charts, users)
-  # ---------------------------------------------------------------------
-  # Separate from RisingWave on purpose: this holds Superset's internal
-  # bookkeeping, not any T24 data. RisingWave is what Superset will query
-  # to build charts, connected as a data source after first login - see
-  # README.md, Step 6.
+  # Superset's own metadata (dashboards, charts, users) - separate from
+  # RisingWave on purpose, which holds the actual T24 data being charted.
   superset-db:
     image: postgres:16-alpine
     container_name: cdc-superset-db
@@ -148,36 +123,23 @@ services:
       timeout: 5s
       retries: 10
 
-  # ---------------------------------------------------------------------
-  # Superset - BI / reporting on top of RisingWave
-  # ---------------------------------------------------------------------
-  # The base image ships with NO Postgres driver (verified: `import
-  # psycopg2` fails out of the box) and NO default superset_config.py.
-  # Both are needed to reach RisingWave, which speaks the Postgres wire
-  # protocol. Fixed here without a custom Dockerfile:
-  #   - entrypoint -> docker-bootstrap.sh (present in the image but unused
-  #     by its default CMD) + DATABASE_DIALECT=postgres makes it install
-  #     the postgres driver on every boot, before starting the app.
-  #   - command app-gunicorn runs the exact same gunicorn launch as the
-  #     image's own default CMD (diffed identical: /usr/bin/run-server.sh
-  #     vs /app/docker/entrypoints/run-server.sh) - only the wrapper
-  #     around it changes, not how the app itself starts.
-  #   - ./superset/superset_config.py is mounted at /app/pythonpath, which
-  #     IS the image's PYTHONPATH but ships empty - this is what sets
-  #     SECRET_KEY and points Superset at superset-db for its own storage.
-  #
-  # First-time setup (schema migration + admin user) is NOT automated here
-  # - same "infra up, app setup is a deliberate manual step" pattern as
-  # oracle-connector.json and risingwave-setup.sql elsewhere in this
-  # project. See README.md, Step 6, for the one-time init command.
+  # Superset - BI/reporting on top of RisingWave. The base image ships with
+  # no Postgres driver and no superset_config.py (both required to reach
+  # RisingWave), fixed here without a custom Dockerfile:
+  #   - entrypoint -> docker-bootstrap.sh + DATABASE_DIALECT=postgres
+  #     installs the driver on every boot before starting the app.
+  #   - command app-gunicorn launches the app identically to the image's
+  #     own default CMD, just via that entrypoint wrapper instead.
+  #   - superset_config.py is mounted at /app/pythonpath (the image's real
+  #     PYTHONPATH, which ships empty) to set SECRET_KEY and point at
+  #     superset-db.
+  # First-time setup (schema migration + admin user) is a manual one-time
+  # step, not automated here - see README.md Step 6.
   superset:
     image: apache/superset:latest
     container_name: cdc-superset
-    # Verified: the image runs as user "superset" (uid 1000) by default, but
-    # docker-bootstrap.sh's driver install only runs when whoami = root - it
-    # silently skips otherwise (no error), which is what happened on the
-    # first attempt here. Overriding back to root is what makes the
-    # DATABASE_DIALECT trick above actually take effect.
+    # Required: docker-bootstrap.sh's driver install only runs as root -
+    # the image's default user (uid 1000) causes it to skip silently.
     user: root
     entrypoint: /app/docker/docker-bootstrap.sh
     command: ["app-gunicorn"]

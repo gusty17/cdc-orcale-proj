@@ -19,10 +19,9 @@ PROMPT ============================================================
 PROMPT 1.1  ARCHIVELOG mode
 PROMPT ============================================================
 
--- Debezium reads redo + archived redo through LogMiner, so the database
--- MUST be in ARCHIVELOG mode. Turning it on requires a restart in MOUNT
--- state, which cannot be done from an ordinary session - so we only
--- verify here and fail loudly with instructions.
+-- Debezium reads via LogMiner, which requires ARCHIVELOG mode. Enabling it
+-- needs a MOUNT-state restart (handled by oracle-init/01_enable_archivelog.sql)
+-- - this just verifies it took effect and fails loudly with instructions if not.
 DECLARE
     v_log_mode v$database.log_mode%TYPE;
 BEGIN
@@ -85,14 +84,13 @@ PROMPT ============================================================
 PROMPT 1.3  Redo log sizing (dev convenience, optional)
 PROMPT ============================================================
 
--- XE ships with small redo logs; frequent switches mean Debezium spends
--- its time re-mining archives. Not required, but recommended for a lab.
--- Left commented so this script stays non-destructive.
+-- Optional, left commented so this script stays non-destructive. XE's
+-- default redo logs are small, causing frequent switches:
 --
 --   ALTER DATABASE ADD LOGFILE GROUP 4 ('/opt/oracle/oradata/XE/redo04.log') SIZE 400M;
 --   ALTER DATABASE ADD LOGFILE GROUP 5 ('/opt/oracle/oradata/XE/redo05.log') SIZE 400M;
 --   ALTER DATABASE ADD LOGFILE GROUP 6 ('/opt/oracle/oradata/XE/redo06.log') SIZE 400M;
---   -- then ALTER SYSTEM SWITCH LOGFILE / CHECKPOINT until groups 1-3 are
+--   -- then ALTER SYSTEM SWITCH LOGFILE / CHECKPOINT until groups 1-2 are
 --   -- INACTIVE and drop them.
 
 PROMPT
