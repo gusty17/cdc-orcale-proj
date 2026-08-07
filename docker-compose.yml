@@ -1,0 +1,165 @@
+name: cdc-oracle
+
+services:
+  # Oracle XE 21c - the CDC source. CDB = XE, PDB = XEPDB1. -faststart ships
+  # with the database pre-built, so it never runs /container-entrypoint-initdb.d
+  # (only used on true first-init) - startdb.d (used below for ARCHIVELOG)
+  # is the only hook that fires on every start.
+  oracle:
+    image: gvenzl/oracle-xe:21-slim-faststart
+    container_name: cdc-oracle
+    environment:
+      ORACLE_PASSWORD: oracle          # SYS / SYSTEM password
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./oracle-init:/container-entrypoint-startdb.d:ro
+      - ./:/scripts:ro                 # so setup.ps1 can run the .sql files in-container
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # Kafka 3.8, single node, KRaft (no ZooKeeper). Two listeners: PLAINTEXT
+  # for containers on this network, EXTERNAL for the host (localhost:29092).
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: cdc-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: cdc-oracle-cluster-1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # Kafka Connect (Debezium) - hosts the Oracle connector. Ships with the
+  # Oracle driver (ojdbc8, orai18n) already bundled - no custom image needed.
+  connect:
+    image: quay.io/debezium/connect:3.6.0.Final
+    container_name: cdc-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      oracle:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: cdc-oracle
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_TOPIC_CREATION_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # RisingWave - streaming SQL engine, reads the Kafka topic directly.
+  # single_node mode (meta/compute/frontend/compactor in one process) is
+  # fine for a lab, not production. Postgres wire protocol on 4566.
+  risingwave:
+    image: risingwavelabs/risingwave:v2.0.5
+    container_name: cdc-risingwave
+    command: single_node
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "4566:4566"    # Postgres-wire SQL port
+      - "5691:5691"    # meta HTTP dashboard
+    environment:
+      RW_SINGLE_NODE_STORE_DIRECTORY: /risingwave/data
+    volumes:
+      - risingwave-data:/risingwave/data
+
+  # Superset's own metadata (dashboards, charts, users) - separate from
+  # RisingWave on purpose, which holds the actual T24 data being charted.
+  superset-db:
+    image: postgres:16-alpine
+    container_name: cdc-superset-db
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+      POSTGRES_DB: superset
+    volumes:
+      - superset-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Superset - BI/reporting on top of RisingWave. The base image ships with
+  # no Postgres driver and no superset_config.py (both required to reach
+  # RisingWave), fixed here without a custom Dockerfile:
+  #   - entrypoint -> docker-bootstrap.sh + DATABASE_DIALECT=postgres
+  #     installs the driver on every boot before starting the app.
+  #   - command app-gunicorn launches the app identically to the image's
+  #     own default CMD, just via that entrypoint wrapper instead.
+  #   - superset_config.py is mounted at /app/pythonpath (the image's real
+  #     PYTHONPATH, which ships empty) to set SECRET_KEY and point at
+  #     superset-db.
+  # First-time setup (schema migration + admin user) is automated by
+  # setup.ps1; only the RisingWave connection is added manually, in the UI.
+  superset:
+    image: apache/superset:latest
+    container_name: cdc-superset
+    # Required: docker-bootstrap.sh's driver install only runs as root -
+    # the image's default user (uid 1000) causes it to skip silently.
+    user: root
+    entrypoint: /app/docker/docker-bootstrap.sh
+    command: ["app-gunicorn"]
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      risingwave:
+        condition: service_started
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "6DKznVtdcH8QhxFbUgzc20di0UJ4IMGooSmn4BLBMwEjUUlg_pM4Xjms"
+      DATABASE_DIALECT: postgres
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-home:/app/superset_home
+
+volumes:
+  oracle-data:
+  kafka-data:
+  risingwave-data:
+  superset-db-data:
+  superset-home:

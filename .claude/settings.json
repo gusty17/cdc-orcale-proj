@@ -11,7 +11,15 @@
       "PowerShell(docker exec cdc-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic t24.T24.ACCOUNT_REAL --from-beginning --timeout-ms 25000 2>$null | Out-File -Encoding utf8 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\events2.txt'; \\(Get-Content 'C:\\\\Users\\\\youss\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--bank-cdc-orcale-proj\\\\cd70f625-ca43-45ae-bcb1-585acea4aded\\\\scratchpad\\\\events2.txt'\\).Count)",
       "PowerShell(Invoke-RestMethod -Method Delete 'http://localhost:8083/connectors/test-account-real')",
       "PowerShell(Invoke-RestMethod -Method Delete 'http://localhost:8083/connectors/test-clean')",
-      "PowerShell('cleaned')"
+      "PowerShell('cleaned')",
+      "PowerShell(Get-Command psql -ErrorAction SilentlyContinue)",
+      "PowerShell(Test-NetConnection -ComputerName localhost -Port 4566 -WarningAction SilentlyContinue)",
+      "Bash(docker network *)",
+      "Bash(docker inspect *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm --network cdc-oracle_default -v /d/bank/cdc-orcale-proj/risingwave/risingwave-setup.sql:/tmp/setup.sql:ro postgres:16-alpine psql -h risingwave -p 4566 -d dev -U root -f /tmp/setup.sql)",
+      "PowerShell(Invoke-RestMethod 'http://localhost:8083/connectors')",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm --network cdc-oracle_default postgres:16-alpine psql -h risingwave -p 4566 -d dev -U root -c ' *)",
+      "Bash(docker run *)"
     ]
   }
 }
