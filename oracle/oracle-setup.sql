@@ -1,16 +1,5 @@
--- =====================================================================
--- Step 1 (continued) - Application schema + table-level supplemental log
--- =====================================================================
--- Run as SYSDBA against the PDB:
---   sqlplus sys/oracle@//localhost:1521/XEPDB1 as sysdba @oracle-setup.sql
---
--- T24.ACCOUNT holds exactly two columns, RECID and XMLRECORD, and the
--- XMLRECORD carries the complete record - every tag from the source
--- sample, unmodified. That makes the lab row a 1:1 copy of production
--- data, which is what the connector and everything downstream is built
--- against.
---
--- Idempotent - safe to re-run.
+-- T24.ACCOUNT holds two columns, RECID and XMLRECORD - a 1:1 copy of
+-- production data, which everything downstream is built against.
 -- =====================================================================
 
 SET SERVEROUTPUT ON
@@ -45,16 +34,7 @@ PROMPT ============================================================
 
 --   RECID     VARCHAR2(255)  - the record key
 --   XMLRECORD XMLTYPE        - the whole record as XML
---
--- Every business field (currency, balances, customer, dates, ...) lives
--- inside the XML as c1, c2, c8, ... - see sample-data/lookup_metadata.csv
--- for the c-number -> business-name mapping. Extraction happens downstream
--- (risingwave-setup.sql), not here.
---
--- The real production table also has 9 VIRTUAL columns computed from the
--- XML via EXTRACTVALUE. They store nothing and produce no redo, so
--- Debezium can't read their values - oracle-connector.json's
--- column.include.list excludes them for this reason.
+
 DECLARE
     v_cnt PLS_INTEGER;
 BEGIN
@@ -81,12 +61,9 @@ PROMPT ============================================================
 PROMPT Table-level supplemental logging on T24.ACCOUNT
 PROMPT ============================================================
 
--- ALL COLUMNS rather than an explicit log group over (RECID, XMLRECORD):
--- Oracle rejects LOB-backed columns inside a supplemental log group, so
--- naming XMLRECORD there fails with "ORA-30569: data type of given column
--- is not supported in a log group". ALL COLUMNS covers RECID (the only
--- plain stored column), and the XML itself reaches Debezium through the
--- LOB redo entries that lob.enabled=true consumes.
+-- ALL COLUMNS, not a log group naming XMLRECORD directly - Oracle rejects
+-- LOB columns in a log group (ORA-30569). XMLRECORD still reaches
+-- Debezium via LOB redo entries, consumed through lob.enabled=true.
 DECLARE
     v_cnt PLS_INTEGER;
 BEGIN
@@ -112,12 +89,9 @@ PROMPT ============================================================
 
 CREATE OR REPLACE DIRECTORY sample_dir AS '/scripts/sample-data';
 
--- Loaded straight from the file rather than typed inline, so the row is
--- byte-for-byte the source sample (all tags, multi-value entries, Arabic
--- text included). RECID is read from the file's row/@id attribute rather
--- than hardcoded - a lab convenience only: in production RECID is stored
--- independently of XMLRECORD (no DATA_DEFAULT from the XML, unlike the
--- virtual columns), it just happens to match row/@id in this one sample.
+-- Loaded from the file, not typed inline, so it's byte-for-byte the real
+-- sample. RECID is read from the file's row/@id - a lab convenience only;
+-- in production RECID is stored independently of the XML.
 DECLARE
     v_clob  CLOB;
     v_bfile BFILE := BFILENAME('SAMPLE_DIR', 'account_xml_data_sample.xml');
@@ -150,46 +124,3 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('Loaded record ' || v_recid || ' from sample file.');
 END;
 /
-
-PROMPT
-PROMPT ============================================================
-PROMPT Verification
-PROMPT ============================================================
-
-SET LINESIZE 200
-COLUMN column_name FORMAT A16
-COLUMN data_type   FORMAT A10
-
-PROMPT -- Two columns. (SYS_NC00003$ is Oracle's own binary-XML storage for
-PROMPT --  XMLRECORD, not a column anyone declared.)
-SELECT internal_column_id AS col, column_name, data_type,
-       hidden_column AS hidden, virtual_column AS virt, segment_column_id AS seg
-  FROM dba_tab_cols
- WHERE owner = 'T24' AND table_name = 'ACCOUNT'
- ORDER BY internal_column_id;
-
-SELECT log_group_name, log_group_type, always
-  FROM dba_log_groups
- WHERE owner = 'T24' AND table_name = 'ACCOUNT';
-
-PROMPT -- The stored XML is complete: node count and a few spot checks.
-SELECT a.recid,
-       (SELECT COUNT(*) FROM XMLTABLE('/row/*' PASSING a.xmlrecord)) AS xml_nodes,
-       DBMS_LOB.GETLENGTH(a.xmlrecord.getClobVal())                  AS xml_chars
-  FROM t24.account a;
-
-COLUMN customer FORMAT A12
-COLUMN currency FORMAT A10
-COLUMN balance  FORMAT A14
-COLUMN title    FORMAT A24
-COLUMN opened   FORMAT A10
-SELECT XMLCAST(XMLQUERY('/row/c1'  PASSING a.xmlrecord RETURNING CONTENT) AS VARCHAR2(50)) AS customer,
-       XMLCAST(XMLQUERY('/row/c8'  PASSING a.xmlrecord RETURNING CONTENT) AS VARCHAR2(50)) AS currency,
-       XMLCAST(XMLQUERY('/row/c27' PASSING a.xmlrecord RETURNING CONTENT) AS VARCHAR2(50)) AS balance,
-       XMLCAST(XMLQUERY('/row/c3'  PASSING a.xmlrecord RETURNING CONTENT) AS VARCHAR2(50)) AS title,
-       XMLCAST(XMLQUERY('/row/c78' PASSING a.xmlrecord RETURNING CONTENT) AS VARCHAR2(50)) AS opened
-  FROM t24.account a;
-
-PROMPT
-PROMPT Step 1 complete. Oracle is ready for the Debezium connector.
-PROMPT

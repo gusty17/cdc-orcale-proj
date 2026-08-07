@@ -16,7 +16,7 @@
       "PowerShell(Test-NetConnection -ComputerName localhost -Port 4566 -WarningAction SilentlyContinue)",
       "Bash(docker network *)",
       "Bash(docker inspect *)",
-      "Bash(MSYS_NO_PATHCONV=1 docker run --rm --network cdc-oracle_default -v /d/bank/cdc-orcale-proj/risingwave-setup.sql:/tmp/setup.sql:ro postgres:16-alpine psql -h risingwave -p 4566 -d dev -U root -f /tmp/setup.sql)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm --network cdc-oracle_default -v /d/bank/cdc-orcale-proj/risingwave/risingwave-setup.sql:/tmp/setup.sql:ro postgres:16-alpine psql -h risingwave -p 4566 -d dev -U root -f /tmp/setup.sql)",
       "PowerShell(Invoke-RestMethod 'http://localhost:8083/connectors')",
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm --network cdc-oracle_default postgres:16-alpine psql -h risingwave -p 4566 -d dev -U root -c ' *)",
       "Bash(docker run *)"

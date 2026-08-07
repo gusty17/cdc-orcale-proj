@@ -1,18 +1,9 @@
 -- RisingWave - consume the Debezium topic straight into a live table.
--- Connect with any Postgres client (wire protocol on 4566):
---   psql -h localhost -p 4566 -d dev -U root
---   -- or, without a local psql, from a throwaway container on the network:
---   docker run --rm --network cdc-oracle_default postgres:16-alpine \
---     psql -h risingwave -p 4566 -d dev -U root -f /dev/stdin < risingwave-setup.sql
---
--- CREATE TABLE (not CREATE SOURCE) so RisingWave stores and maintains a
--- queryable current-state table, applying every Kafka change as it
--- arrives - a SOURCE would only expose the raw stream.
---
--- FORMAT DEBEZIUM ENCODE JSON unwraps Debezium's {op, before, after, ...}
--- envelope and applies each change against PRIMARY KEY (recid), matched
--- via the Kafka message key.
 
+--set the barrier interval to 1 second.
+ALTER SYSTEM SET barrier_interval_ms = 1000;
+
+-- CREATE TABLE t24_account
 CREATE TABLE IF NOT EXISTS t24_account (
     recid     VARCHAR,
     xmlrecord VARCHAR,
@@ -24,12 +15,7 @@ CREATE TABLE IF NOT EXISTS t24_account (
     scan.startup.mode = 'earliest'
 ) FORMAT DEBEZIUM ENCODE JSON;
 
--- Audit / event log - every change, not just current state. t24_account
--- only shows the row's current state; reading the SAME topic again with
--- FORMAT PLAIN (instead of DEBEZIUM) appends every message as its own
--- permanent row instead of collapsing history over the primary key.
--- before/after/source stay as JSONB so this table survives T24 field
--- changes; extraction into named columns happens downstream.
+-- Audit log - every change, not just current state. 
 CREATE TABLE IF NOT EXISTS t24_account_events (
     op       VARCHAR,
     "before" JSONB,
@@ -43,13 +29,7 @@ CREATE TABLE IF NOT EXISTS t24_account_events (
     scan.startup.mode = 'earliest'
 ) FORMAT PLAIN ENCODE JSON;
 
--- Static reference data mapping XML tag (+ position, for multi-value T24
--- fields) to its real business name. Loaded from sample-data/lookup_metadata.csv.
--- Drop + recreate rather than IF NOT EXISTS: no natural single-column key
--- (m_index is nullable), so re-running this file is only safe if it
--- always starts from empty. is_multivalue flags fields that repeat with
--- <cN m="k"> siblings under one base name (e.g. cap_date_cr_int x23) -
--- used by t24_account_columns below to number them instead of colliding.
+-- Create a lookup table to resolve the XML tags into real column names.
 DROP TABLE IF EXISTS lookup_metadata;
 
 CREATE TABLE lookup_metadata (
@@ -58,7 +38,6 @@ CREATE TABLE lookup_metadata (
     resolved_name_en VARCHAR,
     is_multivalue    BOOLEAN
 );
-
 INSERT INTO lookup_metadata (field_index, m_index, resolved_name_en, is_multivalue) VALUES
     ('c20', '18', 'ac_amt_loc', FALSE),
     ('c182', NULL, 'acc_deb_limit', FALSE),
@@ -352,18 +331,12 @@ INSERT INTO lookup_metadata (field_index, m_index, resolved_name_en, is_multival
 
 FLUSH;
 
--- Flattens XMLRECORD into named columns, entirely in RisingWave SQL - no
--- external process. RisingWave has no XML functions, so this is regex,
--- not real XML parsing, in three stages:
---   unpivoted - regexp_matches(..., 'g') in a LATERAL subquery explodes
---     each row's XML into one row per tag: (recid, field, position, value).
---   resolved  - joins against lookup_metadata to resolve each tag into
---     its real column name (exact match wins for position-specific T24
---     LOCAL.REF fields like c20; otherwise base name, numbered only when
---     is_multivalue is true).
---   final SELECT - pivots back to wide columns via MAX(CASE WHEN ...).
--- MATERIALIZED so it stays live and pre-computed (a plain TABLE AS SELECT
--- would freeze at creation; a plain VIEW would re-run this on every query).
+-- Flattens XMLRECORD into named columns via regex - RisingWave has no
+-- XML functions. Three stages:
+--   unpivoted - one row per XML tag: (recid, field, position, value)
+--   resolved  - joins lookup_metadata to get each tag's real column name
+--   final SELECT - pivots back to wide columns via MAX(CASE WHEN ...)
+-- MATERIALIZED so it stays live (a VIEW would re-run this every query).
 CREATE MATERIALIZED VIEW t24_account_columns AS
 WITH unpivoted AS (
     SELECT recid, m[1] AS field, m[2] AS position, m[3] AS value

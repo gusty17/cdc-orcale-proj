@@ -133,8 +133,8 @@ services:
   #   - superset_config.py is mounted at /app/pythonpath (the image's real
   #     PYTHONPATH, which ships empty) to set SECRET_KEY and point at
   #     superset-db.
-  # First-time setup (schema migration + admin user) is a manual one-time
-  # step, not automated here - see README.md Step 6.
+  # First-time setup (schema migration + admin user) is automated by
+  # setup.ps1; only the RisingWave connection is added manually, in the UI.
   superset:
     image: apache/superset:latest
     container_name: cdc-superset

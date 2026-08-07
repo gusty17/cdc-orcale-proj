@@ -4,19 +4,8 @@
 -- Run against XEPDB1:
 --   docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/tests/test-update-cdc.sql"
 --
--- Sets new, random values for the 3 columns the Superset dashboard reads
--- (c23/open_actual_bal, c29/amnt_last_cr_cust, c38/amnt_last_dr_cust) on the
--- seed row (RECID 9000000112345001), using a FULL XMLTYPE replacement
--- rather than UPDATEXML. Testing showed Oracle's in-place UPDATEXML edits
--- don't carry enough redo detail for LogMiner to decode, so Debezium
--- silently drops them - a full-value SET is the only style proven to
--- reliably produce a captured op=u event (see README.md, "UPDATEXML
--- changes are silently dropped").
---
--- Re-runnable any time: each run picks a new balance, so consecutive runs
--- are each a distinct, visible event. This does change the seed row's
--- content - re-run oracle-setup.sql afterward if you want the original
--- sample values restored.
+-- Sets new random values for 3 columns on the seed row
+
 -- =====================================================================
 
 SET SERVEROUTPUT ON
@@ -55,7 +44,7 @@ BEGIN
 
     IF SQL%ROWCOUNT = 0 THEN
         RAISE_APPLICATION_ERROR(-20002,
-            'Seed row ' || v_recid || ' not found - run oracle-setup.sql first.');
+            'Seed row ' || v_recid || ' not found - run oracle/oracle-setup.sql first.');
     END IF;
 
     COMMIT;

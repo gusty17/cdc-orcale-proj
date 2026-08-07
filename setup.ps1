@@ -1,17 +1,16 @@
 <#
     setup.ps1 - bring the whole CDC lab up: Oracle prerequisites, the
-    Debezium connector, and the RisingWave tables/views (including the
-    flattened t24_account_columns materialized view).
+    Debezium connector, the RisingWave tables/views (including the
+    flattened t24_account_columns materialized view), and Superset's
+    one-time init (db upgrade, admin user, roles).
 
     Usage:
         .\setup.ps1            # start containers, then apply everything below
         .\setup.ps1 -SqlOnly   # containers already running, just (re)apply config
         .\setup.ps1 -Down      # tear everything down, volumes included
 
-    Everything this script applies is idempotent, so -SqlOnly (or a plain
-    re-run) is always safe. Superset is started but not configured here -
-    its one-time init (schema migration + admin user) is manual, see
-    README.md Step 6.
+    Idempotent - -SqlOnly or a plain re-run is always safe. Still manual:
+    adding the RisingWave connection inside Superset's UI - see README.md.
 #>
 [CmdletBinding()]
 param(
@@ -19,15 +18,13 @@ param(
     [switch]$Down
 )
 
-# Deliberately NOT 'Stop': docker compose writes its progress to stderr, and
-# under -ErrorActionPreference Stop Windows PowerShell 5.1 turns every native
-# stderr line into a terminating NativeCommandError. Failures are detected via
-# $LASTEXITCODE below instead.
+# Not 'Stop' - docker compose writes progress to stderr, which PS 5.1 would
+# treat as fatal. Failures are checked via $LASTEXITCODE instead.
 $ErrorActionPreference = 'Continue'
 $ProjectDir     = $PSScriptRoot
 $Compose        = Join-Path $ProjectDir 'docker-compose.yml'
 $OraclePass     = 'oracle'
-$ConnectorName  = 't24-account-cdc'   # must match "name" in oracle-connector.json
+$ConnectorName  = 't24-account-cdc'   # must match "name" in oracle/oracle-connector.json
 $RisingWaveNet  = 'cdc-oracle_default'
 
 function Write-Step($text) {
@@ -60,9 +57,8 @@ if (-not $SqlOnly) {
     docker compose -f $Compose up -d
     if ($LASTEXITCODE -ne 0) { throw 'docker compose up failed' }
 
-    # The health check can flip to "healthy" while the startdb.d hook is still
-    # bouncing the database to turn on ARCHIVELOG, so wait for the entrypoint's
-    # own banner instead - it is printed after all startup scripts have run.
+    # Healthcheck can go "healthy" mid-ARCHIVELOG-restart, so wait for the
+    # entrypoint's own ready banner instead.
     Write-Step 'Waiting for Oracle (first boot also enables ARCHIVELOG, which restarts the DB)'
     $ready    = $false
     $deadline = (Get-Date).AddMinutes(10)
@@ -81,10 +77,10 @@ if (-not $SqlOnly) {
 }
 
 Write-Step 'Step 1a - instance prerequisites (CDB$ROOT)'
-Invoke-SqlFile -File 'oracle-prereqs.sql' -Service 'XE'
+Invoke-SqlFile -File 'oracle/oracle-prereqs.sql' -Service 'XE'
 
 Write-Step 'Step 1b - application schema + table supplemental logging (XEPDB1)'
-Invoke-SqlFile -File 'oracle-setup.sql' -Service 'XEPDB1'
+Invoke-SqlFile -File 'oracle/oracle-setup.sql' -Service 'XEPDB1'
 
 Write-Step 'Kafka Connect status'
 # Connect needs ~30-60s to join its group and serve the REST API.
@@ -117,8 +113,7 @@ Write-Step 'Deploying the Debezium connector'
 if (-not $connectReady) {
     Write-Warning '  Skipped - Connect REST API is not up.'
 } else {
-    # POST on an already-existing connector name returns 409 - check first so
-    # this step is safe to re-run, same as everything else in this script.
+    # Check first - POSTing an already-existing connector name returns 409.
     $exists = $false
     try {
         Invoke-RestMethod "http://localhost:8083/connectors/$ConnectorName" -TimeoutSec 10 | Out-Null
@@ -128,7 +123,7 @@ if (-not $connectReady) {
     if ($exists) {
         Write-Host "  Connector '$ConnectorName' already exists, leaving it as-is." -ForegroundColor Green
     } else {
-        $connectorJson = Get-Content (Join-Path $ProjectDir 'oracle-connector.json') -Raw
+        $connectorJson = Get-Content (Join-Path $ProjectDir 'oracle\oracle-connector.json') -Raw
         try {
             Invoke-RestMethod -Method Post -Uri 'http://localhost:8083/connectors' `
                 -ContentType 'application/json' -Body $connectorJson | Out-Null
@@ -155,9 +150,8 @@ if (-not $connectReady) {
 }
 
 Write-Step 'Waiting for the Kafka topic (RisingWave sources need it to already exist)'
-# Connector state RUNNING only means the task started, not that the initial
-# snapshot has reached Kafka yet - risingwave-setup.sql's CREATE TABLE ...
-# WITH (connector='kafka', ...) fails on a fresh stack without this wait.
+# RUNNING only means the task started, not that the snapshot reached Kafka -
+# risingwave-setup.sql's CREATE TABLE needs the topic to already exist.
 $topicReady = $false
 $deadline   = (Get-Date).AddMinutes(2)
 while ((Get-Date) -lt $deadline) {
@@ -173,11 +167,9 @@ if ($topicReady) {
 }
 
 Write-Step 'Applying RisingWave tables/views'
-# No local psql needed - runs via a throwaway container on the compose
-# network. -v ON_ERROR_STOP=1 is required: psql's default is to print an
-# error and keep going, which makes $LASTEXITCODE report success even when
-# every statement failed.
-$rwSql = Get-Content (Join-Path $ProjectDir 'risingwave-setup.sql') -Raw
+# Throwaway container, no local psql needed. ON_ERROR_STOP=1 required -
+# psql's default is to keep going on error, hiding failures from $LASTEXITCODE.
+$rwSql = Get-Content (Join-Path $ProjectDir 'risingwave\risingwave-setup.sql') -Raw
 $rwSql | docker run --rm -i --network $RisingWaveNet postgres:16-alpine `
     psql -h risingwave -p 4566 -d dev -U root -v ON_ERROR_STOP=1
 if ($LASTEXITCODE -ne 0) {
@@ -186,6 +178,40 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host '  t24_account, t24_account_events, t24_account_audit ready.' -ForegroundColor Green
 }
 
+Write-Step 'Superset one-time init (db upgrade, admin user, roles)'
+# The container installs its Postgres driver on first boot (docker-bootstrap.sh,
+# see docker-compose.yml) before the app is usable - retry until db upgrade
+# succeeds instead of assuming Superset is ready the moment the container is.
+$supersetReady = $false
+$deadline = (Get-Date).AddMinutes(3)
+while ((Get-Date) -lt $deadline) {
+    docker exec cdc-superset superset db upgrade
+    if ($LASTEXITCODE -eq 0) { $supersetReady = $true; break }
+    Write-Host '  waiting for Superset (driver install / boot)...'
+    Start-Sleep -Seconds 10
+}
+
+if (-not $supersetReady) {
+    Write-Warning '  Superset never became ready - check: docker logs cdc-superset'
+} else {
+    docker exec cdc-superset superset fab create-admin `
+        --username admin --firstname Admin --lastname User `
+        --email admin@example.com --password admin
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host '  admin user created.' -ForegroundColor Green
+    } else {
+        Write-Host '  admin user already exists.' -ForegroundColor Green
+    }
+
+    docker exec cdc-superset superset init
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning '  superset init failed - check: docker logs cdc-superset'
+    } else {
+        Write-Host '  Superset roles/permissions initialized.' -ForegroundColor Green
+    }
+}
+
 Write-Host ''
-Write-Host 'CDC pipeline is up: Oracle -> Debezium -> Kafka -> RisingWave.' -ForegroundColor Green
-Write-Host 'Next: one-time Superset init (see README.md Step 6) to start building reports.'
+Write-Host 'CDC pipeline is up: Oracle -> Debezium -> Kafka -> RisingWave -> Superset.' -ForegroundColor Green
+Write-Host 'Login at http://localhost:8088 (admin/admin), then add the RisingWave'
+Write-Host 'connection manually - see README.md "Connecting Superset to RisingWave".'

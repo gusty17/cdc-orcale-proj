@@ -1,22 +1,18 @@
--- Mounted into /container-entrypoint-startdb.d - runs on every container
--- start, as SYSDBA. gvenzl/oracle-xe:21 has no ENABLE_ARCHIVELOG env var,
--- and ARCHIVELOG can only be enabled in MOUNT state, which the entrypoint
--- has already passed by the time the DB is reachable - so this checks the
--- current mode and only runs the shutdown/mount/enable/open sequence when
--- it's actually needed. Once enabled it's permanent, so every later start
--- is a one-query no-op.
+-- Runs on every container start. Enables ARCHIVELOG mode if it isn't already on
 
-SET HEADING OFF
-SET FEEDBACK OFF
-SET PAGESIZE 0
-SET LINESIZE 200
-SET TRIMSPOOL ON
-SET VERIFY OFF
-SET TERMOUT OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE
-
+-- Settings below only shape the SELECT+SPOOL step further down: they make
+-- its output plain text, so it can be saved as a valid, runnable script.
+SET HEADING OFF     
+SET FEEDBACK OFF    
+SET PAGESIZE 0      
+SET LINESIZE 200    
+SET TRIMSPOOL ON    
+SET VERIFY OFF      
+SET TERMOUT OFF     
+WHENEVER SQLERROR EXIT SQL.SQLCODE   
 SPOOL /tmp/_enable_archivelog_step.sql
 
+-- Generate the next script's content based on the current log_mode: a
 SELECT CASE
          WHEN log_mode = 'ARCHIVELOG' THEN
            'PROMPT CONTAINER: ARCHIVELOG already enabled, nothing to do.'
@@ -33,10 +29,11 @@ SELECT CASE
   FROM v$database;
 
 SPOOL OFF
-SET TERMOUT ON
+SET TERMOUT ON   -- show the generated script's output as it runs next
 
 @/tmp/_enable_archivelog_step.sql
 
+-- Restore normal defaults for anything that runs after this script
 SET FEEDBACK ON
 SET HEADING ON
 SET PAGESIZE 14

@@ -4,16 +4,9 @@
 -- Run against XEPDB1:
 --   docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/tests/test-delete-cdc.sql"
 --
--- Deletes the MOST RECENTLY inserted row created by test-insert-cdc.sql
--- (recid pattern '9000000112345001-<timestamp>') - never the permanent
--- seed row itself, so this is safe to run without needing to reload
--- anything afterward. Run test-insert-cdc.sql at least once first, or
--- this has nothing to delete.
---
--- Debezium emits a delete as TWO Kafka messages: an op=d event carrying
--- the last known row content, followed by a tombstone (a message with the
--- same key and a null value) that tells downstream consumers to drop any
--- cached copy of that key.
+-- Deletes the most recent row from test-insert-cdc.sql, never the seed
+-- row - safe to run any time. Needs test-insert-cdc.sql run first.
+
 -- =====================================================================
 
 SET SERVEROUTPUT ON

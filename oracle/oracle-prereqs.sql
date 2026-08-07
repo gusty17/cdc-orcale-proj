@@ -1,12 +1,7 @@
 -- =====================================================================
 -- Step 1 - Oracle prerequisites for Debezium LogMiner CDC
 -- =====================================================================
--- Run as SYSDBA, connected to the ROOT container (CDB$ROOT):
---   sqlplus sys/oracle@//localhost:1521/XE as sysdba @oracle-prereqs.sql
---
--- Target: Oracle XE 21c (CDB = XE, PDB = XEPDB1)
--- This script is idempotent - safe to re-run.
--- =====================================================================
+
 
 SET SERVEROUTPUT ON
 SET ECHO OFF
@@ -19,9 +14,8 @@ PROMPT ============================================================
 PROMPT 1.1  ARCHIVELOG mode
 PROMPT ============================================================
 
--- Debezium reads via LogMiner, which requires ARCHIVELOG mode. Enabling it
--- needs a MOUNT-state restart (handled by oracle-init/01_enable_archivelog.sql)
--- - this just verifies it took effect and fails loudly with instructions if not.
+-- LogMiner requires ARCHIVELOG (enabled by oracle-init/01_enable_archivelog.sql).
+-- This just verifies it took effect and fails loudly if not.
 DECLARE
     v_log_mode v$database.log_mode%TYPE;
 BEGIN
@@ -46,8 +40,7 @@ PROMPT ============================================================
 PROMPT 1.2  Database-level supplemental logging (minimal)
 PROMPT ============================================================
 
--- Without this, LogMiner cannot reconstruct the row that a redo entry
--- belongs to and Debezium emits incomplete / unusable change events.
+--enables minimal supplemental logging if not already enabled.
 DECLARE
     v_min VARCHAR2(8);
 BEGIN
@@ -62,8 +55,7 @@ BEGIN
 END;
 /
 
--- Force logging keeps NOLOGGING / direct-path operations out of the blind
--- spot; without it a bulk load can silently bypass CDC.
+-- Enable force logging if not already enabled.
 DECLARE
     v_force VARCHAR2(39);
 BEGIN
@@ -84,8 +76,8 @@ PROMPT ============================================================
 PROMPT 1.3  Redo log sizing (dev convenience, optional)
 PROMPT ============================================================
 
--- Optional, left commented so this script stays non-destructive. XE's
--- default redo logs are small, causing frequent switches:
+-- Optional, commented out on purpose (kept non-destructive). Enlarge if
+-- XE's small default redo logs cause frequent switches:
 --
 --   ALTER DATABASE ADD LOGFILE GROUP 4 ('/opt/oracle/oradata/XE/redo04.log') SIZE 400M;
 --   ALTER DATABASE ADD LOGFILE GROUP 5 ('/opt/oracle/oradata/XE/redo05.log') SIZE 400M;
@@ -98,8 +90,8 @@ PROMPT ============================================================
 PROMPT 1.4  LogMiner tablespaces (CDB + PDB)
 PROMPT ============================================================
 
--- The Debezium user needs a default tablespace it can write to; keeping
--- it separate from SYSTEM/USERS makes it easy to cap and to drop later.
+-- Dedicated tablespace for the Debezium user, kept separate from
+-- SYSTEM/USERS so it's easy to cap or drop later.
 DECLARE
     v_cnt PLS_INTEGER;
 BEGIN
@@ -139,8 +131,8 @@ PROMPT ============================================================
 PROMPT 1.5  Debezium capture user (common user, CONTAINER=ALL)
 PROMPT ============================================================
 
--- In a CDB the connector logs in to the root container and switches into
--- the PDB, so the account has to be a common user (C## prefix).
+-- Common user (C## prefix) - the connector logs into CDB root, then
+-- switches into the PDB.
 DECLARE
     v_cnt PLS_INTEGER;
 BEGIN
@@ -193,37 +185,3 @@ GRANT SELECT ON V_$TRANSACTION            TO c##dbzuser CONTAINER=ALL;
 GRANT SELECT ON V_$MYSTAT                 TO c##dbzuser CONTAINER=ALL;
 GRANT SELECT ON V_$STATNAME               TO c##dbzuser CONTAINER=ALL;
 
-PROMPT
-PROMPT ============================================================
-PROMPT 1.6  Verification
-PROMPT ============================================================
-
-SET LINESIZE 200
-COLUMN name        FORMAT A32
-COLUMN value       FORMAT A12
-COLUMN dest_name   FORMAT A28
-COLUMN destination FORMAT A32
-
-SELECT log_mode,
-       force_logging,
-       supplemental_log_data_min AS supp_min,
-       supplemental_log_data_pk  AS supp_pk,
-       supplemental_log_data_all AS supp_all
-  FROM v$database;
-
--- Informational only - this script no longer sets it. FALSE is expected
--- and correct; see the note above section 1.4.
-SELECT name, value FROM v$parameter WHERE name = 'enable_goldengate_replication';
-
-SELECT username, common, default_tablespace, account_status
-  FROM dba_users WHERE username = 'C##DBZUSER';
-
--- The archive destination must be VALID, otherwise redo piles up and the
--- database eventually hangs with "archiver stuck".
-SELECT dest_name, status, destination
-  FROM v$archive_dest_status
- WHERE status <> 'INACTIVE';
-
-PROMPT
-PROMPT Step 1 (instance level) done. Next: oracle-setup.sql against XEPDB1.
-PROMPT
