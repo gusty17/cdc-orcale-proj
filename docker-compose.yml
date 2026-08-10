@@ -88,6 +88,25 @@ services:
       retries: 20
       start_period: 30s
 
+  # Kafka UI - browse topics/messages in a browser instead of
+  # kafka-console-consumer.sh. Both connectors write plain JSON (schemas
+  # disabled), so messages render directly, no schema registry needed.
+  # Also wired to the Connect REST API, so the t24-account-cdc connector's
+  # status/config/tasks show up in the same UI as the topic content.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: cdc-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+
   # RisingWave - streaming SQL engine, reads the Kafka topic directly.
   # single_node mode (meta/compute/frontend/compactor in one process) is
   # fine for a lab, not production. Postgres wire protocol on 4566.

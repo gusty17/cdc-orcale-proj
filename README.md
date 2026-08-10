@@ -28,6 +28,7 @@ table + 165-column flattened view + audit trail) → Superset reporting.
 | Debezium capture user | `c##dbzuser/dbz` (common user, logs in at CDB root) |
 | Kafka (from host) | `localhost:29092` |
 | Kafka Connect REST | `http://localhost:8083` |
+| Kafka UI | `http://localhost:8080` — browse topics/messages, connector status |
 | RisingWave (psql) | `localhost:4566/dev`, user `root` |
 | Superset | `http://localhost:8088` (`admin`/`admin`) |
 
