@@ -18,7 +18,7 @@ DROP MATERIALIZED VIEW  IF EXISTS t24_trace_parsed;
 DROP TABLE              IF EXISTS t24_trace_arrivals;
 DROP TABLE              IF EXISTS t24_trace_events;
 
--- Stage 2, raw landing. FORMAT PLAIN keeps this append-only - every
+-- Stage 1, raw landing. FORMAT PLAIN keeps this append-only - every
 -- change is its own row, not collapsed over the primary key.
 CREATE TABLE t24_trace_events (
     op       VARCHAR,
@@ -27,7 +27,7 @@ CREATE TABLE t24_trace_events (
     source   JSONB,
     ts_ms    BIGINT
 )
--- t3: set by the PRODUCER (Debezium), not the broker on append - marks
+-- t2: set by the PRODUCER (Debezium), not the broker on append - marks
 -- "Debezium finished", making oracle_to_kafka_ms a clean redo-mining measure.
 INCLUDE timestamp AS kafka_ts
 INCLUDE offset    AS kafka_offset    -- unique id per change event
@@ -38,7 +38,7 @@ WITH (
     scan.startup.mode = 'latest'
 ) FORMAT PLAIN ENCODE JSON;
 
--- Stage 4, parsed layer - mirrors t24_account_columns but grouped by
+-- Stage 3, parsed layer - mirrors t24_account_columns but grouped by
 -- kafka_offset (not recid) so every event stays individually addressable,
 -- not overwritten in place on update.
 CREATE MATERIALIZED VIEW t24_trace_parsed AS
@@ -77,19 +77,17 @@ SELECT kafka_offset,
 FROM resolved
 GROUP BY kafka_offset;
 
--- t4/t5 filled by 02-trace-poller.py. RisingWave can't stamp per-row
+-- t3/t4 filled by 02-trace-poller.py. RisingWave can't stamp per-row
 -- arrival itself (proctime()/now() are restricted, and proctime() on a
 -- table is per-barrier, not per-row) - polling gives a real per-row time.
 CREATE TABLE t24_trace_arrivals (
     kafka_offset BIGINT,
-    t4_ms        BIGINT,   -- t4: first visible in t24_trace_events (raw)
-    t5_ms        BIGINT    -- t5: first visible in t24_trace_parsed (parsed)
+    t3_ms        BIGINT,   -- t3: first visible in t24_trace_events (raw)
+    t4_ms        BIGINT    -- t4: first visible in t24_trace_parsed (parsed)
 );
 
 -- =====================================================================
 -- THE VIEW - one row per change, arrival time at each stage, total.
--- =====================================================================
---   SELECT * FROM t24_cdc_trace ORDER BY t1_oracle;
 -- =====================================================================
 CREATE VIEW t24_cdc_trace AS
 SELECT
@@ -101,26 +99,23 @@ SELECT
     e.kafka_offset,
 
     -- Arrival times
-    to_timestamp(e.t1_generated_ms / 1000.0) AS t1_generated,   -- client built the row
-    to_timestamp(e.t2_oracle_ms    / 1000.0) AS t2_oracle,      -- Oracle executed the INSERT
-    to_timestamp(e.t3_kafka_ms     / 1000.0) AS t3_kafka,       -- written to the Kafka topic
-    to_timestamp(a.t4_ms           / 1000.0) AS t4_risingwave,  -- queryable in RisingWave
-    to_timestamp(a.t5_ms           / 1000.0) AS t5_parsed,      -- queryable, flattened
+    to_timestamp(e.t1_oracle_ms / 1000.0) AS t1_oracle,      -- Oracle executed the INSERT
+    to_timestamp(e.t2_kafka_ms  / 1000.0) AS t2_kafka,       -- written to the Kafka topic
+    to_timestamp(a.t3_ms        / 1000.0) AS t3_risingwave,  -- queryable in RisingWave
+    to_timestamp(a.t4_ms        / 1000.0) AS t4_parsed,      -- queryable, flattened
 
     -- Time spent in each leg
-    e.t2_oracle_ms - e.t1_generated_ms AS gen_to_oracle_ms,  -- network + parse + insert
-    e.t3_kafka_ms  - e.t2_oracle_ms    AS oracle_to_kafka_ms,-- Debezium mining redo
-    a.t4_ms        - e.t3_kafka_ms     AS kafka_to_rw_ms,    -- consume + barrier
-    a.t5_ms        - a.t4_ms           AS rw_to_parsed_ms,   -- flattening
+    e.t2_kafka_ms - e.t1_oracle_ms AS oracle_to_kafka_ms,  -- Debezium mining redo
+    a.t3_ms       - e.t2_kafka_ms  AS kafka_to_rw_ms,      -- consume + barrier
+    a.t4_ms       - a.t3_ms        AS rw_to_parsed_ms,     -- flattening
 
-    -- Total, with two fallbacks: t4 (not t5) for deletes, which never
-    -- parse; t2 (not t1) when there's no client-side <bts> marker.
-    COALESCE(a.t5_ms, a.t4_ms) - COALESCE(e.t1_generated_ms, e.t2_oracle_ms) AS total_ms,
+    -- Total. Falls back to t3 (not t4) for deletes, which never parse.
+    COALESCE(a.t4_ms, a.t3_ms) - e.t1_oracle_ms AS total_ms,
 
-    -- 'exact' = Oracle stamped t2 via SYSTIMESTAMP (ms precision).
+    -- 'exact' = Oracle stamped c250 via t24.stamp_c250() (ms precision).
     -- 'second' = fell back to source.ts_ms (whole seconds, up to 1000ms
     -- error) - true for any change not made by our generators.
-    e.t2_precision
+    e.t1_precision
 FROM (
     SELECT
         kafka_offset::BIGINT AS kafka_offset,
@@ -130,29 +125,34 @@ FROM (
                 WHEN 'd' THEN 'delete'
                 WHEN 'r' THEN 'snapshot'
                 ELSE op END AS op,
-        -- t1: stamped by the CLIENT before sending - NULL for changes
-        -- not made by our generators.
-        CASE WHEN COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD', '') LIKE '%<bts>%'
-             THEN split_part(split_part(COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD'),
-                                        '<bts>', 2), '</bts>', 1)::BIGINT
-        END AS t1_generated_ms,
 
-        -- t2: stamped by ORACLE during the INSERT - falls back to
-        -- source.ts_ms (whole seconds only) if no <ots> marker.
-        CASE WHEN COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD', '') LIKE '%<ots>%'
-             THEN split_part(split_part(COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD'),
-                                        '<ots>', 2), '</ots>', 1)::BIGINT
+        -- t1: c250's value, parsed from Oracle's YYMMDDHH24MISSFF3
+        -- compact-datetime text into epoch ms. Falls back to
+        -- source.ts_ms (whole seconds only) if c250 isn't in that shape
+        -- (a 15-digit run of no other punctuation) - true for any
+        -- change not made by our generators.
+        CASE WHEN c250_raw IS NOT NULL
+             THEN (EXTRACT(EPOCH FROM (
+                     '20' || substring(c250_raw, 1, 2)  || '-' || substring(c250_raw, 3, 2) || '-' ||
+                     substring(c250_raw, 5, 2) || ' ' || substring(c250_raw, 7, 2) || ':' ||
+                     substring(c250_raw, 9, 2) || ':' || substring(c250_raw, 11, 2) || '.' ||
+                     substring(c250_raw, 13, 3)
+                   )::TIMESTAMP) * 1000)::BIGINT
              ELSE (source->>'ts_ms')::BIGINT
-        END AS t2_oracle_ms,
+        END AS t1_oracle_ms,
 
-        CASE WHEN COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD', '') LIKE '%<ots>%'
-             THEN 'exact' ELSE 'second' END AS t2_precision,
+        CASE WHEN c250_raw IS NOT NULL THEN 'exact' ELSE 'second' END AS t1_precision,
 
-        (EXTRACT(EPOCH FROM kafka_ts) * 1000)::BIGINT AS t3_kafka_ms
-    FROM t24_trace_events
-    -- Skip tombstones - Debezium's null-payload delete marker, not a
-    -- real data change.
-    WHERE op IS NOT NULL
+        (EXTRACT(EPOCH FROM kafka_ts) * 1000)::BIGINT AS t2_kafka_ms
+    FROM (
+        SELECT *,
+               (regexp_match(COALESCE("after"->>'XMLRECORD', "before"->>'XMLRECORD', ''),
+                              '<c250[^>]*>(\d{15})</c250>'))[1] AS c250_raw
+        FROM t24_trace_events
+        -- Skip tombstones - Debezium's null-payload delete marker, not
+        -- a real data change.
+        WHERE op IS NOT NULL
+    ) t
 ) e
 -- LEFT, not inner - an inner join would silently hide any change the
 -- poller wasn't running for. LEFT keeps it visible with NULL timings.

@@ -1,5 +1,5 @@
 """
-Fills t4 (raw arrival) and t5 (parsed arrival) for the CDC trace.
+Fills t3 (raw arrival) and t4 (parsed arrival) for the CDC trace.
 
 Start in the background BEFORE making changes in Oracle:
 
@@ -24,8 +24,8 @@ conn = psycopg2.connect(host="risingwave", port=4566, user="root", dbname="dev")
 conn.autocommit = True
 cur = conn.cursor()
 
-raw    = {}   # kafka_offset -> t4_ms  (None = present before we started)
-parsed = {}   # kafka_offset -> t5_ms  (None = present before we started)
+raw    = {}   # kafka_offset -> t3_ms  (None = present before we started)
+parsed = {}   # kafka_offset -> t4_ms  (None = present before we started)
 
 # Seed with everything ALREADY visible - a change that landed before
 # this poller started can't be timed meaningfully, and without this the
@@ -81,19 +81,19 @@ while True:
         break
     time.sleep(POLL_MS / 1000)
 
-# Deletes carry no XML to parse, so t5 stays NULL - total_ms falls back to t4.
+# Deletes carry no XML to parse, so t4 stays NULL - total_ms falls back to t3.
 new_rows = [
-    (int(off), t4, parsed.get(off))
-    for off, t4 in raw.items()
-    if t4 is not None and off not in already_recorded   # skip seeded + previously recorded
+    (int(off), t3, parsed.get(off))
+    for off, t3 in raw.items()
+    if t3 is not None and off not in already_recorded   # skip seeded + previously recorded
 ]
 
 if new_rows:
     values = ",".join(cur.mogrify("(%s,%s,%s)", r).decode() for r in new_rows)
     cur.execute(
-        "INSERT INTO t24_trace_arrivals (kafka_offset, t4_ms, t5_ms) VALUES " + values
+        "INSERT INTO t24_trace_arrivals (kafka_offset, t3_ms, t4_ms) VALUES " + values
     )
 
-n_parsed = sum(1 for _, _, t5 in new_rows if t5 is not None)
+n_parsed = sum(1 for _, _, t4 in new_rows if t4 is not None)
 print(f"poller: timed {len(new_rows)} new changes, {n_parsed} of them parsed "
       f"(poll interval {POLL_MS}ms)")

@@ -13,7 +13,7 @@ SELECT * FROM t24_cdc_trace ORDER BY t1_oracle;
 |---|---|
 | `recid` | the changed row |
 | `op` | `insert` / `update` / `delete` |
-| `t1_oracle` | **x** — changed in Oracle |
+| `t1_oracle` | **x** — Oracle executed the change |
 | `t2_kafka` | **y** — written to the Kafka topic |
 | `t3_risingwave` | **z** — queryable in RisingWave |
 | `t4_parsed` | **m** — queryable in the parsed/flattened form |
@@ -23,14 +23,20 @@ SELECT * FROM t24_cdc_trace ORDER BY t1_oracle;
 | `total_ms` | **x → m**, the whole journey |
 | `t1_precision` | `exact` (ms) or `second` — see below |
 
+There is no `t1`. An earlier version stamped a client-side "message
+built" time into a synthetic `<bts>` tag, but that tag has no equivalent
+in T24's real schema, so seed/test rows would carry a field production
+rows never would. `t1` is the first stage instead, and it rides on a
+real column: `c250` is genuinely T24's `date_time` field.
+
 ## Sample output
 
 ```
- recid                  | op     | t1_oracle    | t2_kafka     | t3_risingwave | t4_parsed    | o2k  | k2r  | r2p | total_ms
- BENCH-1785962567759-1  | insert | 20:42:47.759 | 20:42:51.303 | 20:42:51.977  | 20:42:51.977 | 3544 |  674 |   0 |     4218
- BENCH-1785962573778-4  | insert | 20:42:53.778 | 20:42:55.814 | 20:42:56.847  | 20:42:56.847 | 2036 | 1033 |   0 |     3069
- BENCH-1785962567759-1  | update | 20:43:27.847 | 20:43:30.402 | 20:43:30.979  | 20:43:30.979 | 2555 |  577 |   0 |     3132
- BENCH-1785962601842-18 | delete | 20:43:51     | 20:43:54.462 | 20:43:54.844  |              | 3462 |  382 |     |     3844
+ recid                  | op     | t1_oracle    | t2_kafka     | t3_risingwave | t4_parsed    | ora2kafka | kafka2rw | rw2parsed | total_ms
+ BENCH-260811143752193-1| insert | 14:37:52.193 | 14:37:55.803 | 14:37:56.477  | 14:37:56.477 |      3610 |      674 |         0 |     4284
+ BENCH-260811143758211-4| insert | 14:37:58.211 | 14:38:00.814 | 14:38:01.847  | 14:38:01.847 |      2603 |     1033 |         0 |     3636
+ BENCH-260811143752193-1| update | 14:38:27.847 | 14:38:30.402 | 14:38:30.979  | 14:38:30.979 |      2555 |      577 |         0 |     3132
+ BENCH-260811143801842-8| delete | 14:38:51     | 14:38:54.462 | 14:38:54.844  |              |      3462 |      382 |           |     3844
 ```
 
 Typical total is **3-5 seconds**. Two things stand out:
@@ -48,22 +54,23 @@ only hop worth tuning first.
 
 `t1` is the one timestamp the pipeline does not hand over cleanly.
 
-- **`exact`** — the load generator wrote its commit time into the row as
-  `<bts>epoch_ms</bts>`, so `t1` is good to the millisecond. Applies to
-  inserts and updates.
-- **`second`** — no marker, so `t1` falls back to Debezium's
-  `source.ts_ms`. Oracle takes that from the redo log as a `DATE`:
-  **whole seconds only**. `t1` and `total_ms` therefore carry up to
-  1000ms of error. You can see it in the sample above — the delete rows'
-  `t1_oracle` ends in `:51` with no fraction.
+- **`exact`** — the change wrote its commit time into `c250` via the
+  shared `t24.stamp_c250()` function (`oracle/oracle-setup.sql`), so `t1`
+  is good to the millisecond. Applies to inserts and updates made by
+  `seed/seed_xml.py` or `benchmarks/03-oracle-load.py` — the latter
+  imports `insert_one()`/`update_one()` straight from `seed/_xml_ops.py`
+  (the same functions `seed/seed_xml.py` and `tests/test-update-cdc.py`
+  call) rather than re-implementing them, so every generator measures
+  the pipeline identically.
+- **`second`** — `c250` isn't in that shape, so `t1` falls back to
+  Debezium's `source.ts_ms`. Oracle takes that from the redo log as a
+  `DATE`: **whole seconds only**. `t1` and `total_ms` therefore carry up
+  to 1000ms of error. You can see it in the sample above — the delete
+  row's `t1_oracle` ends in `:51` with no fraction.
 
 Deletes are always `second`: a delete sends no new XML, so there is
-nowhere to stamp the time. Any change not made by the generator —
+nowhere to stamp the time. Any change not made by the generators —
 including real T24 activity — is also `second`.
-
-`<bts>` is deliberately not a `<cNNN>` tag. The flattening regex matches
-`'<(c\d+)...>'` only, so the marker is invisible to it and creates no
-spurious column.
 
 ## How it is built
 
@@ -117,7 +124,7 @@ Get-Content benchmarks\01-trace-setup.sql | docker exec -i cdc-superset-db psql 
 Get-Content benchmarks\02-trace-poller.py | docker exec -i cdc-superset python -
 
 # 3. make changes (20 inserts, 10 updates, 10 deletes @ 2s)
-docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/benchmarks/03-oracle-load.sql"
+python benchmarks\03-oracle-load.py
 
 # 4. read the trace
 docker exec cdc-superset-db psql -h cdc-risingwave -p 4566 -d dev -U root -c "SELECT * FROM t24_cdc_trace ORDER BY t1_oracle;"
@@ -126,7 +133,13 @@ docker exec cdc-superset-db psql -h cdc-risingwave -p 4566 -d dev -U root -c "SE
 docker exec cdc-oracle sqlplus -S -L "sys/oracle@//localhost:1521/XEPDB1 as sysdba" "@/scripts/benchmarks/04-cleanup.sql"
 ```
 
-The trace works on **any** change, not just the generator's — make an
+Or drive it end-to-end (poller + load + report, scoped to just that run)
+with `.\benchmarks\run-trace.ps1 -Load benchmark`. `-Load continuous`,
+`-Load update` and `-Load delete` run `seed/seed_xml.py` and
+`tests/test-update-cdc.py` / `tests/test-delete-cdc.py` instead — see
+`run-trace.ps1 -?` for the full mode list.
+
+The trace works on **any** change, not just the generators' — make an
 update by hand in SQL*Plus and it appears, with `t1_precision = 'second'`.
 
 ## Things that will bite you

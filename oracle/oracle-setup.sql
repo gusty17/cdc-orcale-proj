@@ -1,5 +1,9 @@
--- T24.ACCOUNT holds two columns, RECID and XMLRECORD - a 1:1 copy of
--- production data, which everything downstream is built against.
+-- Creates the T24 schema and its two account tables - T24.ACCOUNT
+-- (XMLTYPE) and T24.ACCOUNT_BLOB (BLOB) - plus the config each needs to
+-- reach Debezium. No data loading here: seeding/inserting is a separate,
+-- deliberate step - see seed/seed_xml.py and seed/seed_blob.py, which
+-- read sample files directly from the host and build every INSERT
+-- client-side, so this file has nothing else to provision for them.
 -- =====================================================================
 
 SET SERVEROUTPUT ON
@@ -25,7 +29,44 @@ BEGIN
 END;
 /
 
-GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE TO t24;
+-- CREATE PROCEDURE is for stamp_c250() below - must be a stored,
+-- schema-level function, not block-local, because PL/SQL blocks cannot
+-- call a block-local function from a SQL statement (PLS-00231), and
+-- calling it from inside an INSERT/UPDATE is what keeps the timestamp
+-- atomic with the commit.
+GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE, CREATE PROCEDURE TO t24;
+
+PROMPT
+PROMPT ============================================================
+PROMPT Helper function - shared by seed/, tests/, and benchmarks/
+PROMPT ============================================================
+
+-- Stamps c250 (T24's real 'date_time' field) with Oracle's own current
+-- moment, to the millisecond. One canonical place for this so every
+-- caller - seed/_xml_ops.py's insert_one()/update_one(), used by
+-- seed/seed_xml.py, tests/test-update-cdc.py, and
+-- benchmarks/03-oracle-load.py - shares the exact same logic instead of
+-- each re-implementing the REGEXP_REPLACE.
+--
+-- c250 appears twice in the sample data (the base tag and its m="2"
+-- sibling); REGEXP_REPLACE with backreferences keeps whichever opening
+-- tag was actually there while replacing only the value inside it.
+--
+-- SYS_EXTRACT_UTC, not bare SYSTIMESTAMP - matches Kafka/Debezium's UTC
+-- convention explicitly rather than relying on the container also
+-- happening to run in UTC.
+--
+-- seed/seed_blob.py does NOT call this - REGEXP_REPLACE only works on
+-- text (CLOB/VARCHAR2), never BLOB, and that script deliberately builds
+-- its BLOB client-side to avoid needing a text-to-BLOB bridge function.
+CREATE OR REPLACE FUNCTION t24.stamp_c250(p_xml CLOB) RETURN CLOB IS
+BEGIN
+    RETURN REGEXP_REPLACE(p_xml, '(<c250[^>]*>)[^<]*(</c250>)',
+        '\1' || TO_CHAR(SYS_EXTRACT_UTC(SYSTIMESTAMP), 'YYMMDDHH24MISSFF3') || '\2');
+END;
+/
+
+GRANT EXECUTE ON t24.stamp_c250 TO system;
 
 PROMPT
 PROMPT ============================================================
@@ -84,43 +125,60 @@ END;
 
 PROMPT
 PROMPT ============================================================
-PROMPT Seed row - the complete sample record, tag for tag
+PROMPT T24.ACCOUNT_BLOB  -  RECID + BLOBRECORD, the BLOB storage path
 PROMPT ============================================================
 
-CREATE OR REPLACE DIRECTORY sample_dir AS '/scripts/sample-data';
+-- A SEPARATE table, not a second column on T24.ACCOUNT. In T24 a given
+-- table is either XML or BLOB, never both - a second column would put
+-- both representations in every row, doubling redo per change and
+-- corrupting the latency baseline the benchmarks measure.
+--   RECID      VARCHAR2(255)  - the record key
+--   BLOBRECORD BLOB           - the whole record as raw bytes (XML text,
+--                                stored as a BLOB instead of XMLTYPE)
 
--- Loaded from the file, not typed inline, so it's byte-for-byte the real
--- sample. RECID is read from the file's row/@id - a lab convenience only;
--- in production RECID is stored independently of the XML.
 DECLARE
-    v_clob  CLOB;
-    v_bfile BFILE := BFILENAME('SAMPLE_DIR', 'account_xml_data_sample.xml');
-    v_dst   INTEGER := 1;
-    v_src   INTEGER := 1;
-    v_lang  INTEGER := 0;
-    v_warn  INTEGER;
-    v_recid VARCHAR2(255);
+    v_cnt PLS_INTEGER;
 BEGIN
-    DBMS_LOB.CREATETEMPORARY(v_clob, TRUE);
-    DBMS_LOB.FILEOPEN(v_bfile, DBMS_LOB.FILE_READONLY);
-    -- 873 = AL32UTF8
-    DBMS_LOB.LOADCLOBFROMFILE(v_clob, v_bfile, DBMS_LOB.LOBMAXSIZE,
-                              v_dst, v_src, 873, v_lang, v_warn);
-    DBMS_LOB.FILECLOSE(v_bfile);
+    SELECT COUNT(*) INTO v_cnt
+      FROM dba_tables WHERE owner = 'T24' AND table_name = 'ACCOUNT_BLOB';
 
-    SELECT XMLCAST(XMLQUERY('/row/@id' PASSING XMLTYPE(v_clob) RETURNING CONTENT) AS VARCHAR2(255))
-      INTO v_recid FROM dual;
+    IF v_cnt = 0 THEN
+        EXECUTE IMMEDIATE q'[
+            CREATE TABLE t24.account_blob (
+                recid      VARCHAR2(255) NOT NULL,
+                blobrecord BLOB,
+                CONSTRAINT pk_account_blob PRIMARY KEY (recid)
+            )
+        ]';
+        DBMS_OUTPUT.PUT_LINE('Created T24.ACCOUNT_BLOB.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('T24.ACCOUNT_BLOB already exists.');
+    END IF;
+END;
+/
 
-    MERGE INTO t24.account a
-    USING (SELECT v_recid AS recid FROM dual) s
-    ON (a.recid = s.recid)
-    WHEN MATCHED THEN
-        UPDATE SET a.xmlrecord = XMLTYPE(v_clob)
-    WHEN NOT MATCHED THEN
-        INSERT (recid, xmlrecord) VALUES (s.recid, XMLTYPE(v_clob));
-    COMMIT;
+PROMPT
+PROMPT ============================================================
+PROMPT Table-level supplemental logging on T24.ACCOUNT_BLOB
+PROMPT ============================================================
 
-    DBMS_LOB.FREETEMPORARY(v_clob);
-    DBMS_OUTPUT.PUT_LINE('Loaded record ' || v_recid || ' from sample file.');
+-- Same requirement, same reason as T24.ACCOUNT above: ALL COLUMNS, not a
+-- log group naming BLOBRECORD directly - ORA-30569 rejects a LOB column
+-- in a named log group. Applies identically to a native BLOB.
+DECLARE
+    v_cnt PLS_INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO v_cnt
+      FROM dba_log_groups
+     WHERE owner = 'T24'
+       AND table_name = 'ACCOUNT_BLOB'
+       AND log_group_type = 'ALL COLUMN LOGGING';
+
+    IF v_cnt = 0 THEN
+        EXECUTE IMMEDIATE 'ALTER TABLE t24.account_blob ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS';
+        DBMS_OUTPUT.PUT_LINE('Added ALL COLUMNS supplemental logging on T24.ACCOUNT_BLOB.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('T24.ACCOUNT_BLOB already has ALL COLUMNS supplemental logging.');
+    END IF;
 END;
 /

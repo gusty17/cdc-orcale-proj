@@ -5,17 +5,31 @@
     one-time init (db upgrade, admin user, roles).
 
     Usage:
-        .\setup.ps1            # start containers, then apply everything below
-        .\setup.ps1 -SqlOnly   # containers already running, just (re)apply config
-        .\setup.ps1 -Down      # tear everything down, volumes included
+        .\setup.ps1                    # start containers, then apply everything below
+        .\setup.ps1 -SqlOnly           # containers already running, just (re)apply config
+        .\setup.ps1 -Down              # tear everything down, volumes included
+        .\setup.ps1 -RecreateConnector # delete + redeploy the connector (see warning below)
 
     Idempotent - -SqlOnly or a plain re-run is always safe. Still manual:
     adding the RisingWave connection inside Superset's UI - see README.md.
+
+    -RecreateConnector does NOT re-snapshot existing tables. Debezium
+    reuses its saved offsets in _connect_offsets even after delete+recreate
+    under the same name/topic.prefix, and snapshot.mode=initial only
+    snapshots on a connector's first-ever run. If you've just added a new
+    captured table (e.g. T24.ACCOUNT_BLOB) and need its existing rows
+    picked up, use `.\setup.ps1 -Down` then `.\setup.ps1` instead - that
+    wipes the volumes (and offsets) along with the containers, so the
+    next snapshot genuinely covers everything. -RecreateConnector only
+    helps if you also re-run oracle/oracle-setup.sql afterwards, so its
+    MERGE fires as an UPDATE and emits a streaming event Debezium can pick
+    up without a snapshot.
 #>
 [CmdletBinding()]
 param(
     [switch]$SqlOnly,
-    [switch]$Down
+    [switch]$Down,
+    [switch]$RecreateConnector
 )
 
 # Not 'Stop' - docker compose writes progress to stderr, which PS 5.1 would
@@ -120,8 +134,16 @@ if (-not $connectReady) {
         $exists = $true
     } catch { }
 
+    if ($exists -and $RecreateConnector) {
+        Write-Host "  -RecreateConnector: deleting '$ConnectorName' before redeploying..." -ForegroundColor Yellow
+        Invoke-RestMethod -Method Delete -Uri "http://localhost:8083/connectors/$ConnectorName" -TimeoutSec 10 | Out-Null
+        Start-Sleep -Seconds 2
+        $exists = $false
+    }
+
     if ($exists) {
         Write-Host "  Connector '$ConnectorName' already exists, leaving it as-is." -ForegroundColor Green
+        Write-Host "  (config changes, e.g. a newly added table, need -RecreateConnector or -Down - see script header)" -ForegroundColor DarkYellow
     } else {
         $connectorJson = Get-Content (Join-Path $ProjectDir 'oracle\oracle-connector.json') -Raw
         try {
@@ -149,21 +171,26 @@ if (-not $connectReady) {
     }
 }
 
-Write-Step 'Waiting for the Kafka topic (RisingWave sources need it to already exist)'
+Write-Step 'Waiting for the Kafka topics (RisingWave sources need them to already exist)'
 # RUNNING only means the task started, not that the snapshot reached Kafka -
-# risingwave-setup.sql's CREATE TABLE needs the topic to already exist.
-$topicReady = $false
-$deadline   = (Get-Date).AddMinutes(2)
+# risingwave-setup.sql's CREATE TABLEs need both topics to already exist.
+# A topic with zero rows to snapshot (e.g. an empty T24.ACCOUNT_BLOB) is
+# never auto-created by Kafka until Debezium actually produces to it -
+# see benchmarks/README.md for the same trap hit during a full data wipe.
+$expectedTopics = @('t24.T24.ACCOUNT', 't24.T24.ACCOUNT_BLOB')
+$topicsReady    = $false
+$deadline       = (Get-Date).AddMinutes(2)
 while ((Get-Date) -lt $deadline) {
     $topics = docker exec cdc-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list 2>$null
-    if ($topics -contains 't24.T24.ACCOUNT') { $topicReady = $true; break }
-    Write-Host '  waiting for topic t24.T24.ACCOUNT ...'
+    $missing = $expectedTopics | Where-Object { $topics -notcontains $_ }
+    if (-not $missing) { $topicsReady = $true; break }
+    Write-Host "  waiting for topic(s): $($missing -join ', ') ..."
     Start-Sleep -Seconds 5
 }
-if ($topicReady) {
-    Write-Host '  topic t24.T24.ACCOUNT exists.' -ForegroundColor Green
+if ($topicsReady) {
+    Write-Host "  topics exist: $($expectedTopics -join ', ')" -ForegroundColor Green
 } else {
-    Write-Warning '  Topic never appeared - RisingWave setup below will likely fail. Check: docker logs cdc-connect'
+    Write-Warning "  Topic(s) never appeared: $($missing -join ', ') - RisingWave setup below will likely fail. Check: docker logs cdc-connect"
 }
 
 Write-Step 'Applying RisingWave tables/views'
@@ -175,7 +202,10 @@ $rwSql | docker run --rm -i --network $RisingWaveNet postgres:16-alpine `
 if ($LASTEXITCODE -ne 0) {
     Write-Warning '  RisingWave setup failed - check: docker logs cdc-risingwave'
 } else {
-    Write-Host '  t24_account, t24_account_events, t24_account_audit ready.' -ForegroundColor Green
+    # t24_account_audit doesn't exist (dropped in commit 75a6b5a) - this
+    # used to reference it regardless of success/failure.
+    Write-Host '  t24_account, t24_account_events, t24_account_columns,' -ForegroundColor Green
+    Write-Host '  t24_account_blob, t24_account_blob_events, t24_account_blob_columns ready.' -ForegroundColor Green
 }
 
 Write-Step 'Superset one-time init (db upgrade, admin user, roles)'

@@ -9,13 +9,20 @@
 -- RisingWave trace objects need no cleanup - 01-trace-setup.sql recreates them.
 -- =====================================================================
 
--- BENCH- from benchmarks/03-oracle-load.sql, LOAD- from
--- tests/test-insert-cdc-continuous.py, BULK- from
--- tests/test-insert-cdc-bulk.sql.
+-- BENCH- from benchmarks/03-oracle-load.py, SEED- from seed/seed_xml.py
+-- and seed/seed_blob.py (both tables). LOAD-/BULK- are from generators
+-- that no longer exist (tests/test-insert-cdc-continuous.py,
+-- tests/test-insert-cdc-bulk.sql) - kept here only to sweep up any rows
+-- still left over from before they were removed.
 DELETE FROM t24.account
- WHERE recid LIKE 'BENCH-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
+ WHERE recid LIKE 'BENCH-%' OR recid LIKE 'SEED-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
+DELETE FROM t24.account_blob
+ WHERE recid LIKE 'BENCH-%' OR recid LIKE 'SEED-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
 COMMIT;
 
 SELECT COUNT(*) AS generated_rows_remaining FROM t24.account
- WHERE recid LIKE 'BENCH-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
-SELECT COUNT(*) AS total_rows FROM t24.account;
+ WHERE recid LIKE 'BENCH-%' OR recid LIKE 'SEED-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
+SELECT COUNT(*) AS generated_blob_rows_remaining FROM t24.account_blob
+ WHERE recid LIKE 'BENCH-%' OR recid LIKE 'SEED-%' OR recid LIKE 'LOAD-%' OR recid LIKE 'BULK-%';
+SELECT COUNT(*) AS total_rows      FROM t24.account;
+SELECT COUNT(*) AS total_blob_rows FROM t24.account_blob;

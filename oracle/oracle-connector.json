@@ -12,12 +12,14 @@
     "database.pdb.name": "XEPDB1",
 
     "topic.prefix": "t24",
-    "table.include.list": "T24\\.ACCOUNT",
 
-    "//": "Only the 2 physically stored columns - the other 9 are virtual and arrive as garbage text without this filter.",
-    "column.include.list": "T24\\.ACCOUNT\\.(RECID|XMLRECORD)",
+    "//table": "ONE connector, both tables - include-lists are fully matched, so ACCOUNT does not accidentally also match ACCOUNT_BLOB; each must be listed explicitly. A second connector would open a second LogMiner session mining the SAME redo stream twice - redo mining is 65-71% of measured end-to-end latency, so that cost is real, not theoretical.",
+    "table.include.list": "T24\\.(ACCOUNT|ACCOUNT_BLOB)",
 
-    "//lob": "Required - XMLRECORD is XMLTYPE, stored as a hidden BLOB.",
+    "//column": "Only the 2 physically stored columns per table - the other 9 on ACCOUNT are virtual and arrive as garbage text without this filter. column.include.list is a whitelist across ALL captured tables - omitting ACCOUNT_BLOB here would silently drop every one of its columns, not just leave it at defaults.",
+    "column.include.list": "T24\\.ACCOUNT\\.(RECID|XMLRECORD),T24\\.ACCOUNT_BLOB\\.(RECID|BLOBRECORD)",
+
+    "//lob": "Required - XMLRECORD is XMLTYPE (a hidden BLOB) and BLOBRECORD is a native BLOB. Both reach Debezium via LOB redo entries, consumed identically through this one setting.",
     "lob.enabled": "true",
 
     "//strategy": "online_catalog avoids waiting on log archival to see changes (default redo_log_catalog can stall indefinitely on XE's small redo logs). Trade-off: can't track DDL on the captured table - fine here.",
@@ -25,7 +27,8 @@
 
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
     "schema.history.internal.kafka.topic": "schema-history.t24",
-
+    
+    "//benchmarks": "On a connector's first-ever run, take a full snapshot of the current table contents before switching to streaming new changes.",
     "snapshot.mode": "initial",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",

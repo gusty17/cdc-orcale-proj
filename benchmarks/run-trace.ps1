@@ -15,9 +15,10 @@
     ~20x/sec permanently would load the very instance being measured.
 
 .PARAMETER Load
-    bulk       - 100 rows in one transaction (tests/test-insert-cdc-bulk.sql)
-    benchmark  - 20 inserts + 10 updates + 10 deletes (benchmarks/03-oracle-load.sql)
-    continuous - 1 row/sec until -Seconds elapses
+    benchmark  - 20 inserts + 10 updates + 10 deletes (benchmarks/03-oracle-load.py)
+    continuous - 1 row/sec until -Seconds elapses (seed/seed_xml.py)
+    update     - one update, on the most recently inserted row (tests/test-update-cdc.py)
+    delete     - one delete, on the most recently inserted row (tests/test-delete-cdc.py)
     none       - poller only; make changes yourself in another terminal
 
 .PARAMETER Seconds
@@ -27,14 +28,14 @@
     Report on everything in the trace, not just this run.
 
 .EXAMPLE
-    .\benchmarks\run-trace.ps1 -Load bulk
+    .\benchmarks\run-trace.ps1 -Load benchmark
 
 .EXAMPLE
     .\benchmarks\run-trace.ps1 -Load continuous -Seconds 30
 #>
 param(
-    [ValidateSet('bulk', 'benchmark', 'continuous', 'none')]
-    [string]$Load = 'bulk',
+    [ValidateSet('benchmark', 'continuous', 'update', 'delete', 'none')]
+    [string]$Load = 'benchmark',
 
     [int]$Seconds = 30,
 
@@ -45,7 +46,6 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$sqlplus = 'sys/oracle@//localhost:1521/XEPDB1 as sysdba'
 $psqlArgs = @('-h', 'cdc-risingwave', '-p', '4566', '-d', 'dev', '-U', 'root')
 
 function Invoke-Psql([string]$sql) {
@@ -86,20 +86,30 @@ Write-Host "trace window: kafka offset >= $startOffset"
 # ------------------------------------------------------------------ load
 Write-Host "running load: $Load" -ForegroundColor Cyan
 switch ($Load) {
-    'bulk' {
-        docker exec cdc-oracle sqlplus -S -L $sqlplus "@/scripts/tests/test-insert-cdc-bulk.sql"
-    }
     'benchmark' {
-        docker exec cdc-oracle sqlplus -S -L $sqlplus "@/scripts/benchmarks/03-oracle-load.sql"
+        # Runs directly on the host, not in a container - same as update/delete below.
+        python benchmarks\03-oracle-load.py
     }
     'continuous' {
         # Started detached, stopped on a timer - the loader never exits on its own.
+        # DELAY_SECONDS pinned to 1 - seed_xml.py's own default is 0.5s, which
+        # would silently change this benchmark's pacing vs. what's documented above.
+        $env:DELAY_SECONDS = '1'
         $loader = Start-Process -NoNewWindow -PassThru -FilePath 'python' `
-                                -ArgumentList 'tests\test-insert-cdc-continuous.py'
+                                -ArgumentList 'seed\seed_xml.py'
         Write-Host "  running for ${Seconds}s..."
         Start-Sleep -Seconds $Seconds
         Stop-Process -Id $loader.Id -Force
+        Remove-Item Env:\DELAY_SECONDS -ErrorAction SilentlyContinue
         Write-Host "  loader stopped"
+    }
+    'update' {
+        # Runs directly on the host, not in a container - test-update-cdc.py
+        # connects to Oracle via localhost:1521, same as seed/*.py.
+        python tests\test-update-cdc.py
+    }
+    'delete' {
+        python tests\test-delete-cdc.py
     }
     'none' {
         Write-Host "  make your changes now - poller stops 20s after they end"
@@ -139,7 +149,6 @@ Write-Host "`n--- trace ($(if ($All) {'all runs'} else {'this run'})) ---" -Fore
 docker exec cdc-superset-db psql @psqlArgs -c @"
 SELECT op,
        count(*)                                     AS changes,
-       round(avg(gen_to_oracle_ms)::numeric, 0)     AS gen2ora,
        round(avg(oracle_to_kafka_ms)::numeric, 0)   AS ora2kafka,
        round(avg(kafka_to_rw_ms)::numeric, 0)       AS kafka2rw,
        round(avg(rw_to_parsed_ms)::numeric, 0)      AS rw2parsed,
